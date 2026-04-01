@@ -73,6 +73,9 @@ class StrategyConfig:
     # Allow buying both UP and DOWN in the same window
     allow_both_sides: bool = True
 
+    # Reject entry if bid/ask spread exceeds this (wide spreads hide fake edge)
+    max_entry_spread: float = 0.06
+
     def to_dict(self):
         return asdict(self)
 
@@ -307,6 +310,23 @@ class Database:
         """)
         self.conn.commit()
 
+        # Schema migrations — safe for existing DBs (SQLite has no IF NOT EXISTS for columns)
+        for sql in [
+            "ALTER TABLE price_ticks ADD COLUMN up_spread REAL",
+            "ALTER TABLE price_ticks ADD COLUMN down_spread REAL",
+            "ALTER TABLE price_ticks ADD COLUMN up_change_10s REAL",
+            "ALTER TABLE price_ticks ADD COLUMN down_change_10s REAL",
+            "ALTER TABLE paper_trades ADD COLUMN shares REAL",
+            "ALTER TABLE paper_trades ADD COLUMN seconds_remaining REAL",
+            "ALTER TABLE paper_trades ADD COLUMN spread_at_trade REAL",
+            "ALTER TABLE paper_trades ADD COLUMN signal_json TEXT",
+        ]:
+            try:
+                self.conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+        self.conn.commit()
+
     # ── Config ────────────────────────────────────────────────────────────────
 
     def save_config(self, config: StrategyConfig):
@@ -346,29 +366,37 @@ class Database:
 
     def insert_tick(self, slug, timestamp, seconds_remaining,
                     up_bid, up_ask, up_mid, down_bid, down_ask, down_mid,
-                    btc_spot, btc_delta, source="rest"):
+                    btc_spot, btc_delta, source="rest",
+                    up_spread=None, down_spread=None,
+                    up_change_10s=None, down_change_10s=None):
         self.conn.execute("""
             INSERT INTO price_ticks
             (slug, timestamp, seconds_remaining,
              up_best_bid, up_best_ask, up_midpoint,
              down_best_bid, down_best_ask, down_midpoint,
-             btc_spot_price, btc_delta_from_open, price_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             btc_spot_price, btc_delta_from_open, price_source,
+             up_spread, down_spread, up_change_10s, down_change_10s)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (slug, timestamp, seconds_remaining,
               up_bid, up_ask, up_mid,
               down_bid, down_ask, down_mid,
-              btc_spot, btc_delta, source))
+              btc_spot, btc_delta, source,
+              up_spread, down_spread, up_change_10s, down_change_10s))
         self.conn.commit()
 
     # ── Paper trades ──────────────────────────────────────────────────────────
 
     def insert_trade(self, slug, timestamp, side, action,
-                     price, size, reason, pnl, bankroll):
+                     price, size, reason, pnl, bankroll,
+                     shares=None, seconds_remaining=None,
+                     spread_at_trade=None, signal_json=None):
         self.conn.execute("""
             INSERT INTO paper_trades
-            (slug, timestamp, side, action, price, size, reason, pnl, bankroll_after)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (slug, timestamp, side, action, price, size, reason, pnl, bankroll))
+            (slug, timestamp, side, action, price, size, reason, pnl, bankroll_after,
+             shares, seconds_remaining, spread_at_trade, signal_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (slug, timestamp, side, action, price, size, reason, pnl, bankroll,
+              shares, seconds_remaining, spread_at_trade, signal_json))
         self.conn.commit()
 
     # ── Live trades ───────────────────────────────────────────────────────────
@@ -413,7 +441,7 @@ class PaperTrader:
         self.config = config
         self.db = db
         self.bankroll = config.starting_bankroll
-        self.positions: dict[str, list[Position]] = {}  # slug → [Position]
+        self.positions: dict[str, dict[str, Position]] = {}  # slug → {side → Position}
         self._load_bankroll()
 
     def _load_bankroll(self):
@@ -424,14 +452,16 @@ class PaperTrader:
             self.bankroll = row["bankroll_after"]
 
     def get_positions(self, slug: str) -> list[Position]:
-        return self.positions.get(slug, [])
+        return list(self.positions.get(slug, {}).values())
 
     def has_position(self, slug: str, side: str) -> bool:
-        return any(p.side == side for p in self.get_positions(slug))
+        return side in self.positions.get(slug, {})
 
     def evaluate_entry(self, slug: str, side: str, best_ask: float,
-                       seconds_remaining: float, btc_delta: float) -> bool:
+                       best_bid: float, seconds_remaining: float) -> bool:
         if best_ask <= 0 or best_ask > self.config.entry_threshold:
+            return False
+        if best_ask - best_bid > self.config.max_entry_spread:
             return False
         if seconds_remaining < self.config.min_time_remaining_secs:
             return False
@@ -450,9 +480,17 @@ class PaperTrader:
         shares = size / price
         pos    = Position(side=side, entry_price=price, size=size,
                           shares=shares, entry_time=now)
-        self.positions.setdefault(slug, []).append(pos)
+        self.positions.setdefault(slug, {})[side] = pos
         self.bankroll -= size
-        self.db.insert_trade(slug, now, side, "buy", price, size, "entry", 0, self.bankroll)
+        ctx = getattr(self, '_entry_signal', None)
+        self._entry_signal = None
+        self.db.insert_trade(
+            slug, now, side, "buy", price, size, "entry", 0, self.bankroll,
+            shares=shares,
+            seconds_remaining=ctx.get("seconds_remaining") if ctx else None,
+            spread_at_trade=ctx.get("spread") if ctx else None,
+            signal_json=json.dumps(ctx) if ctx else None,
+        )
         logging.info(
             f"📗 PAPER BUY  {side.upper()} @ ${price:.2f} | "
             f"${size:.2f} → {shares:.1f} shares | bankroll ${self.bankroll:.2f}"
@@ -472,16 +510,23 @@ class PaperTrader:
 
     def execute_sell(self, slug: str, side: str, price: float,
                      reason: str, now: float):
-        positions = [p for p in self.get_positions(slug) if p.side == side]
-        if not positions:
+        pos_map = self.positions.get(slug, {})
+        if side not in pos_map:
             return
-        pos      = positions[0]
+        pos      = pos_map[side]
         proceeds = pos.shares * price
         pnl      = proceeds - pos.size
         self.bankroll += proceeds
-        self.positions[slug] = [p for p in self.positions[slug] if p.side != side]
-        self.db.insert_trade(slug, now, side, "sell", price, proceeds,
-                             reason, pnl, self.bankroll)
+        del self.positions[slug][side]
+        ctx = getattr(self, '_exit_signal', None)
+        self._exit_signal = None
+        self.db.insert_trade(
+            slug, now, side, "sell", price, proceeds, reason, pnl, self.bankroll,
+            shares=pos.shares,
+            seconds_remaining=ctx.get("seconds_remaining") if ctx else None,
+            spread_at_trade=ctx.get("spread") if ctx else None,
+            signal_json=json.dumps(ctx) if ctx else None,
+        )
         emoji = "📈" if pnl > 0 else "📉"
         logging.info(
             f"{emoji} PAPER SELL {side.upper()} @ ${price:.2f} | "
@@ -489,7 +534,7 @@ class PaperTrader:
         )
 
     def handle_resolution(self, slug: str, resolution: str, now: float):
-        for pos in self.get_positions(slug):
+        for pos in list(self.positions.get(slug, {}).values()):
             if pos.side == resolution:
                 proceeds = pos.shares * 1.0
                 pnl      = proceeds - pos.size
@@ -501,6 +546,7 @@ class PaperTrader:
                 slug, now, pos.side, "sell",
                 1.0 if pos.side == resolution else 0.0,
                 proceeds, "resolution", pnl, self.bankroll,
+                shares=pos.shares,
             )
             emoji = "💰" if pnl > 0 else "💀"
             logging.info(
@@ -528,6 +574,7 @@ class Observer:
         self.markets_observed = 0
         self._current_tokens: Optional[dict] = None
         self._current_btc_open: Optional[float] = None
+        self._last_mids: dict[str, tuple] = {}  # slug → (up_mid, down_mid) from prior tick
 
         signal.signal(signal.SIGINT,  self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -639,16 +686,25 @@ class Observer:
                 btc_now = self.btc.get_btc_price()
 
                 if up_prices and down_prices:
-                    btc_delta = (btc_now - self._current_btc_open) \
-                                if btc_now and self._current_btc_open else 0.0
-                    up_mid   = (up_prices["best_bid"]   + up_prices["best_ask"])   / 2
-                    down_mid = (down_prices["best_bid"] + down_prices["best_ask"]) / 2
+                    btc_delta  = (btc_now - self._current_btc_open) \
+                                 if btc_now and self._current_btc_open else 0.0
+                    up_mid     = (up_prices["best_bid"]   + up_prices["best_ask"])   / 2
+                    down_mid   = (down_prices["best_bid"] + down_prices["best_ask"]) / 2
+                    up_spread   = up_prices["best_ask"]   - up_prices["best_bid"]
+                    down_spread = down_prices["best_ask"] - down_prices["best_bid"]
+
+                    last = self._last_mids.get(slug)
+                    up_change_10s   = round(up_mid   - last[0], 4) if last else None
+                    down_change_10s = round(down_mid - last[1], 4) if last else None
+                    self._last_mids[slug] = (up_mid, down_mid)
 
                     self.db.insert_tick(
                         slug, now, seconds_remaining,
                         up_prices["best_bid"],   up_prices["best_ask"],   up_mid,
                         down_prices["best_bid"], down_prices["best_ask"], down_mid,
                         btc_now, btc_delta,
+                        up_spread=up_spread, down_spread=down_spread,
+                        up_change_10s=up_change_10s, down_change_10s=down_change_10s,
                     )
 
                     logging.info(
@@ -668,12 +724,28 @@ class Observer:
                             slug, side, prices["best_bid"], seconds_remaining
                         )
                         if reason:
+                            self.trader._exit_signal = {
+                                "seconds_remaining": round(seconds_remaining, 1),
+                                "spread": round(prices["best_ask"] - prices["best_bid"], 4),
+                                "up_mid": round(up_mid, 4),
+                                "down_mid": round(down_mid, 4),
+                                "btc_delta": round(btc_delta, 2),
+                            }
                             self.trader.execute_sell(slug, side, prices["best_bid"], reason, now)
 
                     for side, prices in (("up", up_prices), ("down", down_prices)):
                         if self.trader.evaluate_entry(
-                            slug, side, prices["best_ask"], seconds_remaining, btc_delta
+                            slug, side, prices["best_ask"], prices["best_bid"], seconds_remaining
                         ):
+                            self.trader._entry_signal = {
+                                "seconds_remaining": round(seconds_remaining, 1),
+                                "spread": round(prices["best_ask"] - prices["best_bid"], 4),
+                                "up_mid": round(up_mid, 4),
+                                "down_mid": round(down_mid, 4),
+                                "btc_delta": round(btc_delta, 2),
+                                "up_change_10s": up_change_10s,
+                                "down_change_10s": down_change_10s,
+                            }
                             self.trader.execute_buy(slug, side, prices["best_ask"], now)
 
                 time.sleep(self.config.poll_interval_secs)
@@ -771,6 +843,7 @@ def analyze(db_path: str = "polymarket_observer.db"):
                                     ) THEN t.timestamp END) AS exit_time
                     FROM markets m JOIN price_ticks t ON t.slug = m.slug
                     WHERE m.resolution IS NOT NULL
+                      AND (SELECT COUNT(*) FROM price_ticks WHERE slug = m.slug) >= 10
                     GROUP BY m.slug
                     UNION ALL
                     SELECT m.slug,
@@ -782,6 +855,7 @@ def analyze(db_path: str = "polymarket_observer.db"):
                                     ) THEN t.timestamp END) AS exit_time
                     FROM markets m JOIN price_ticks t ON t.slug = m.slug
                     WHERE m.resolution IS NOT NULL
+                      AND (SELECT COUNT(*) FROM price_ticks WHERE slug = m.slug) >= 10
                     GROUP BY m.slug
                 )
             """, {"e": entry_t, "x": exit_t}).fetchone()

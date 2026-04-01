@@ -26,6 +26,8 @@ export POLYMARKET_PRIVATE_KEY=0x...
 python trader.py
 ```
 
+Note: `requirements.txt` only lists `requests` and `py-clob-client` — `websockets` is missing from it but is required by trader.py.
+
 No build step, no test suite — these are single-file scripts. Syntax-check with:
 ```bash
 python3 -c "import ast; ast.parse(open('observer.py').read())"
@@ -51,14 +53,42 @@ Two files with a clean inheritance relationship:
 - `LiveObserver(Observer)` — wires the above together. Overrides `_get_prices()` (WebSocket-first, REST fallback), `_on_new_market()` (register tokens + subscribe WebSocket), `_finalize_market()` (cancel open orders before resolving).
 - `setup_keys()` / `build_client()` — one-time credential derivation via `create_or_derive_api_creds()`. Saves `api_key`/`api_secret`/`api_passphrase` to `~/.polypanic/keys.json`.
 
+## Database Schema
+
+All data in `polymarket_observer.db` (SQLite), created on first run, shared by both scripts.
+
+```sql
+markets         slug, window_start/end_ts, up/down_token_id, btc_open/close_price, resolution
+price_ticks     per-poll bid/ask/mid for UP+DOWN sides, btc_spot, btc_delta, price_source ('rest'|'ws')
+paper_trades    simulated buy/sell: price, size, reason, pnl, bankroll_after
+live_trades     real orders: order_id, requested_price, filled_price (NULL until confirmed), size_usdc, reason
+strategy_config last-used StrategyConfig as JSON (id=1 always)
+```
+
 ## Key API Details
 
 - **CLOB API:** `https://clob.polymarket.com` — order book, pricing, order placement
 - **Gamma API:** `https://gamma-api.polymarket.com` — market/event discovery
-- **Auth:** `signature_type=0` for EOA wallets. L2 credentials derived from private key via `create_or_derive_api_creds()` (not `create_api_key()`).
+- **WebSocket:** `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+- **Auth:** `signature_type=0` for EOA wallets. L2 credentials derived from private key via `create_or_derive_api_creds()` (not `create_api_key()`). Keys saved as `api_key`/`api_secret`/`api_passphrase` (not `key`/`secret`/`passphrase`).
+- **Orders:** `OrderArgs.size` is in **shares**, not USDC. Compute `shares = usdc_amount / price`. If price fails tick size validation, round: `round(round(price / tick) * tick, 10)`.
 - **Cancel:** `clob.cancel(order_id)` — plain string, not a dict
+- **Heartbeat (critical):** `clob.post_heartbeat(heartbeat_id)` — first call pass `None`, use returned ID for subsequent calls. Must fire within 10s or Polymarket cancels ALL open orders.
 - **USDC approval** required once before first trade: `client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))`
 - **Fees (from 2026-03-30):** crypto taker 0.072%, maker rebate 20%
+
+**WebSocket subscription message:**
+```json
+{"type": "market", "assets_ids": ["token_id_1", "token_id_2"], "markets": [], "initial_dump": true}
+```
+Send `"PING"` string every ~45s to keep alive. Events received: `event_type: "book"` (full snapshot with `bids`/`asks` arrays of `{"price", "size"}`) and `event_type: "price_change"` (delta with `changes: [{"side": "BUY"|"SELL", "price", "size"}]` — size=0 means level removed).
+
+## Architectural Decisions
+
+- **Two files over one** — `observer.py` stays auth-free and self-contained. `trader.py` imports from it.
+- **Optimistic fills** — local position state updated immediately on order placement; `filled_price` stays NULL until confirmed. Acceptable for v1.
+- **GTC for all orders** — both entries and exits. `force_exit` uses `price * 0.95` to improve fill odds near window close.
+- **REST fallback** — WebSocket is primary; REST polls only when WebSocket data is >5s stale. The `poll_interval_secs` config only kicks in during WebSocket unavailability.
 
 ## Strategy
 
