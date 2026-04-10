@@ -6,19 +6,18 @@ Watches every 5-minute Bitcoin up/down market on Polymarket, logs the full price
 
 Polymarket's 5-minute BTC markets are driven by retail sentiment that overshoots in both directions — often independent of what BTC is actually doing. The play:
 
-1. **Buy** whichever side is cheap (ask ≤ entry threshold)
+1. **Buy** whichever side is cheap (ask ≤ entry threshold, and ≥ min entry floor)
 2. **Sell** when the market overreacts the other way (bid ≥ exit threshold)
-3. **Cut losses** via stop-loss if the position goes the wrong way
-4. **Hold through close** if BTC has moved strongly in your favor — let resolution pay $1.00/share instead of force-selling cheap
+3. **Never hold through resolution** — force-exit before close unless BTC has moved strongly in your favor
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-pip install requests py-clob-client websockets
+pip install requests py-clob-client websockets flask
 
-# Run paper trader with recommended settings
-./run.sh observer.py --stop-loss 0.10 --entry-delay 5 --btc-momentum 30 --hold-threshold 15
+# Run paper trader (recommended settings)
+./run.sh observer.py --entry 0.40 --exit 0.65 --min-entry 0.15
 
 # Analyze collected data after running for a while
 ./run.sh observer.py --analyze
@@ -27,19 +26,24 @@ pip install requests py-clob-client websockets
 ./run.sh observer.py --help
 ```
 
+`run.sh` activates the `.venv` automatically. You can also call `python observer.py` directly if your environment is already set up.
+
 ## Configuration Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--entry` | 0.40 | Buy when best ask ≤ this price |
 | `--exit` | 0.65 | Sell when best bid ≥ this price |
+| `--min-entry` | 0.15 | Reject entries below this price — avoids buying near-dead markets |
 | `--stop-loss` | 0 | Sell if price drops to this (0 = disabled) |
+| `--stop-loss-after` | 60 | Only trigger stop-loss in the final N seconds of the window (0 = fire anytime) |
 | `--entry-delay` | 0 | Seconds to wait before first buy each window |
 | `--btc-momentum` | 0 | Skip buying a side if BTC has moved $X against it from window open (0 = disabled) |
 | `--hold-threshold` | 0 | Skip force_exit near close if BTC has moved $X in your favor — let it resolve at $1.00 (0 = disabled) |
-| `--bankroll` | 1000 | Starting paper bankroll |
-| `--poll` | 3.0 | Seconds between REST price polls |
+| `--only-side` | — | Restrict entries to `up` or `down` only |
 | `--single-side` | false | Only allow one position per market window |
+| `--bankroll` | 1000 | Starting paper bankroll |
+| `--poll` | 3.0 | Seconds between REST price polls (WebSocket takes over in live mode) |
 | `--db` | polymarket_observer.db | SQLite database path |
 | `--analyze` | — | Run post-hoc analysis on collected data |
 
@@ -49,13 +53,13 @@ Two files with a clean inheritance relationship:
 
 **`observer.py`** — no auth required. Run this first to validate the strategy before touching real money.
 - `StrategyConfig` — all tunable parameters
-- `PolymarketClient` — read-only REST client
+- `PolymarketClient` — read-only REST client. Market slugs are deterministic: `btc-updown-5m-{floor(unix_ts/300)*300}`
 - `BTCPriceClient` — BTC spot price with fallback chain (Coinbase → Kraken → Binance → CoinGecko)
-- `Database` — SQLite with 5 tables: `markets`, `price_ticks`, `paper_trades`, `live_trades`, `strategy_config`
+- `Database` — SQLite with 5 tables: `markets`, `price_ticks`, `paper_trades`, `live_trades`, `strategy_config`. WAL mode enabled.
 - `PaperTrader` — simulated execution engine
 - `Observer` — main loop, designed for subclassing
 
-**`trader.py`** — imports from `observer.py`, adds live execution via the Polymarket CLOB API.
+**`trader.py`** — imports from `observer.py`, adds live execution via the Polymarket CLOB API and WebSocket price feed.
 
 ## Terminal Output
 
@@ -72,21 +76,21 @@ ROI is green when up, red when down for the current window. When the window clos
 ## Live Trading Setup
 
 ```bash
-# One-time key derivation
-./run.sh trader.py --setup-keys --private-key 0x...
-# (use env var instead of CLI flag — CLI args appear in ps aux)
+# One-time key derivation (use env var — CLI args appear in ps aux)
 export POLYMARKET_PRIVATE_KEY=0x...
+./run.sh trader.py --setup-keys
 
 # Run live trader
 ./run.sh trader.py
 ```
 
-Live trading has not been tested against mainnet yet. Run paper mode for several days first.
+Live trading has not been tested against mainnet yet. Run paper mode for several days first and confirm the edge is holding via `--analyze`.
 
 ## Files
 
-- `observer.py` — paper trading bot
+- `observer.py` — paper trading bot + data collection
 - `trader.py` — live trading layer (imports observer.py)
 - `run.sh` — activates `.venv` and runs any script
+- `dashboard.py` — Flask dashboard (in repo but not actively maintained)
 - `polymarket_observer.db` — SQLite database (created on first run, gitignored)
 - `observer.log` — log file (gitignored)
