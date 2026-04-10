@@ -1,0 +1,10 @@
+{
+  "entry_threshold": 0.40,
+  "exit_threshold": 0.65,
+  "stop_loss": 0.10,
+  "stop_loss_after": 60,
+  "entry_delay": 5,
+  "btc_momentum": 30.0,
+  "bankroll": 1000.0,
+  "poll": 3.0
+}

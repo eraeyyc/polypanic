@@ -108,6 +108,9 @@ class StrategyConfig:
     # 0 = stop_loss fires immediately regardless of time remaining
     stop_loss_after_secs: int = 0
 
+    # Restrict entries to one side only: "up", "down", or "" for both
+    only_side: str = ""
+
     def to_dict(self):
         return asdict(self)
 
@@ -512,6 +515,8 @@ class PaperTrader:
                        best_bid: float, seconds_remaining: float,
                        btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> bool:
         if side in self._stopped_out.get(slug, set()):
+            return False
+        if self.config.only_side and side != self.config.only_side:
             return False
         if best_ask <= 0 or best_ask > self.config.entry_threshold:
             return False
@@ -1030,6 +1035,7 @@ def main():
     parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
     parser.add_argument("--hold-threshold",    type=float, default=0.0, help="Hold through close if BTC moved $X in your favor (0=off)")
     parser.add_argument("--stop-loss-after",   type=int,   default=0,  help="Only trigger stop_loss in final N seconds of window (0=anytime)")
+    parser.add_argument("--only-side",         default="", choices=["", "up", "down"], help="Restrict entries to one side only")
     parser.add_argument("--log-level",      default="INFO")
     args = parser.parse_args()
 
@@ -1065,6 +1071,7 @@ def main():
         btc_momentum_threshold=args.btc_momentum,
         hold_through_close_btc_threshold=args.hold_threshold,
         stop_loss_after_secs=args.stop_loss_after,
+        only_side=args.only_side,
     )
     Observer(config, db_path=args.db).run()
 
