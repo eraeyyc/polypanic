@@ -28,7 +28,21 @@ import signal
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Optional
+import re
 import requests
+
+
+# ─── Terminal colors ──────────────────────────────────────────────────────────
+
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
+_BOLD   = "\033[1m"
+_RESET  = "\033[0m"
+_ANSI   = re.compile(r'\033\[[0-9;]*m')
+
+
+def _colored(text: str, color: str) -> str:
+    return f"{color}{_BOLD}{text}{_RESET}"
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -75,6 +89,14 @@ class StrategyConfig:
 
     # Reject entry if bid/ask spread exceeds this (wide spreads hide fake edge)
     max_entry_spread: float = 0.06
+
+    # Don't enter until this many seconds have elapsed since window open (0 = off)
+    entry_delay_secs: int = 0
+
+    # Don't buy a side if BTC has moved more than this many dollars against it
+    # e.g. 30.0 means: skip DOWN if BTC is up $30+ from open, skip UP if BTC is down $30+
+    # 0 = disabled
+    btc_momentum_threshold: float = 0.0
 
     def to_dict(self):
         return asdict(self)
@@ -458,13 +480,21 @@ class PaperTrader:
         return side in self.positions.get(slug, {})
 
     def evaluate_entry(self, slug: str, side: str, best_ask: float,
-                       best_bid: float, seconds_remaining: float) -> bool:
+                       best_bid: float, seconds_remaining: float,
+                       btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> bool:
         if best_ask <= 0 or best_ask > self.config.entry_threshold:
             return False
         if best_ask - best_bid > self.config.max_entry_spread:
             return False
         if seconds_remaining < self.config.min_time_remaining_secs:
             return False
+        if self.config.entry_delay_secs > 0 and elapsed_secs < self.config.entry_delay_secs:
+            return False
+        if self.config.btc_momentum_threshold > 0:
+            if side == "down" and btc_delta > self.config.btc_momentum_threshold:
+                return False
+            if side == "up" and btc_delta < -self.config.btc_momentum_threshold:
+                return False
         if not self.config.allow_both_sides:
             other = "down" if side == "up" else "up"
             if self.has_position(slug, other):
@@ -575,6 +605,7 @@ class Observer:
         self._current_tokens: Optional[dict] = None
         self._current_btc_open: Optional[float] = None
         self._last_mids: dict[str, tuple] = {}  # slug → (up_mid, down_mid) from prior tick
+        self._window_start_bankroll: float = self.trader.bankroll
 
         signal.signal(signal.SIGINT,  self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -660,8 +691,9 @@ class Observer:
                         tokens["market_id"], tokens["up_token_id"], tokens["down_token_id"],
                         btc_open,
                     )
-                    self._current_tokens   = tokens
-                    self._current_btc_open = btc_open
+                    self._current_tokens        = tokens
+                    self._current_btc_open      = btc_open
+                    self._window_start_bankroll = self.trader.bankroll
 
                     # Notify subclasses (WebSocket subscription, LiveTrader registration, etc.)
                     self._on_new_market(slug, tokens)
@@ -707,15 +739,20 @@ class Observer:
                         up_change_10s=up_change_10s, down_change_10s=down_change_10s,
                     )
 
+                    deployed   = sum(p.size for p in self.trader.get_positions(slug))
+                    window_pnl = (self.trader.bankroll + deployed) - self._window_start_bankroll
+                    pnl_str    = _colored(f"ROI {window_pnl:+.2f}", _GREEN if window_pnl >= 0 else _RED)
+
                     logging.info(
                         f"   ⏱ {seconds_remaining:5.1f}s | "
                         f"UP  bid={up_prices['best_bid']:.2f} ask={up_prices['best_ask']:.2f} | "
                         f"DN  bid={down_prices['best_bid']:.2f} ask={down_prices['best_ask']:.2f} | "
-                        f"BTC ${btc_now:,.2f} ({btc_delta:+.2f})"
+                        f"BTC ${btc_now:,.2f} ({btc_delta:+.2f}) | {pnl_str}"
                         if btc_now else
                         f"   ⏱ {seconds_remaining:5.1f}s | "
                         f"UP  bid={up_prices['best_bid']:.2f} ask={up_prices['best_ask']:.2f} | "
-                        f"DN  bid={down_prices['best_bid']:.2f} ask={down_prices['best_ask']:.2f}"
+                        f"DN  bid={down_prices['best_bid']:.2f} ask={down_prices['best_ask']:.2f} | "
+                        f"{pnl_str}"
                     )
 
                     # Exits first, then entries
@@ -733,9 +770,12 @@ class Observer:
                             }
                             self.trader.execute_sell(slug, side, prices["best_bid"], reason, now)
 
+                    elapsed_secs = 300 - seconds_remaining
+
                     for side, prices in (("up", up_prices), ("down", down_prices)):
                         if self.trader.evaluate_entry(
-                            slug, side, prices["best_ask"], prices["best_bid"], seconds_remaining
+                            slug, side, prices["best_ask"], prices["best_bid"],
+                            seconds_remaining, btc_delta=btc_delta, elapsed_secs=elapsed_secs
                         ):
                             self.trader._entry_signal = {
                                 "seconds_remaining": round(seconds_remaining, 1),
@@ -773,9 +813,13 @@ class Observer:
             self.db.update_market_close(slug, btc_close, resolution)
             if self.trader.get_positions(slug):
                 self.trader.handle_resolution(slug, resolution, time.time())
+            window_pnl  = self.trader.bankroll - self._window_start_bankroll
+            pnl_str     = _colored(f"{window_pnl:+.2f}", _GREEN if window_pnl >= 0 else _RED)
+            arrow       = "▲" if window_pnl >= 0 else "▼"
             logging.info(
                 f"   ✅ Resolved: {resolution.upper()} | "
-                f"BTC ${row['btc_open_price']:,.2f} → ${btc_close:,.2f}"
+                f"BTC ${row['btc_open_price']:,.2f} → ${btc_close:,.2f} | "
+                f"Window P&L: {arrow} {pnl_str}  (bankroll ${self.trader.bankroll:.2f})"
             )
 
     def _print_summary(self):
@@ -938,18 +982,27 @@ def main():
     parser.add_argument("--stop-loss",   type=float, default=0.0,  help="Stop-loss price (0=off)")
     parser.add_argument("--bankroll",    type=float, default=1000.0)
     parser.add_argument("--poll",        type=float, default=3.0,  help="REST poll interval seconds")
-    parser.add_argument("--single-side", action="store_true",      help="Only one position per market")
-    parser.add_argument("--log-level",   default="INFO")
+    parser.add_argument("--single-side",    action="store_true",    help="Only one position per market")
+    parser.add_argument("--entry-delay",    type=int,   default=0,  help="Seconds to wait before first buy (default 0)")
+    parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
+    parser.add_argument("--log-level",      default="INFO")
     args = parser.parse_args()
+
+    fmt = "%(asctime)s %(message)s"
+
+    class _PlainFormatter(logging.Formatter):
+        def format(self, record):
+            return _ANSI.sub('', super().format(record))
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+
+    file_handler = logging.FileHandler("observer.log")
+    file_handler.setFormatter(_PlainFormatter(fmt, datefmt="%H:%M:%S"))
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
-        format="%(asctime)s %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("observer.log"),
-        ],
+        handlers=[console_handler, file_handler],
     )
 
     if args.analyze:
@@ -963,6 +1016,8 @@ def main():
         starting_bankroll=args.bankroll,
         poll_interval_secs=args.poll,
         allow_both_sides=not args.single_side,
+        entry_delay_secs=args.entry_delay,
+        btc_momentum_threshold=args.btc_momentum,
     )
     Observer(config, db_path=args.db).run()
 

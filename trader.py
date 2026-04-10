@@ -163,10 +163,14 @@ class PriceWebSocket:
         with self._lock:
             ts   = self._timestamps.get(token_id, 0.0)
             book = self._books.get(token_id)
-        if not book or time.time() - ts > self.STALE_SEC:
-            return None
-        bid = book.best_bid
-        ask = book.best_ask
+            # Read best_bid / best_ask while holding the lock so the background
+            # writer thread cannot mutate book._bids / book._asks concurrently.
+            # Releasing the lock between fetching `book` and iterating its dicts
+            # risks RuntimeError("dictionary changed size during iteration").
+            if not book or time.time() - ts > self.STALE_SEC:
+                return None
+            bid = book.best_bid
+            ask = book.best_ask
         if ask <= 0:
             return None
         return {"best_bid": bid, "best_ask": ask}
@@ -301,6 +305,11 @@ class LiveTrader(PaperTrader):
         # "slug:side" → {"order_id": str, "type": "buy"|"sell"}
         self._pending: dict[str, dict] = {}
 
+        # Keys where a SELL order was attempted but failed.  We track these to
+        # prevent the main loop from re-triggering execute_sell every tick after
+        # a transient API error, which would place duplicate real sell orders.
+        self._sell_attempted: set[str] = set()
+
         # slug → {"up": token_id, "down": token_id}
         self._tokens: dict[str, dict] = {}
 
@@ -394,6 +403,16 @@ class LiveTrader(PaperTrader):
             self._cancel_order(slug, side)
             return
 
+        # A previous SELL attempt failed (API error).  Don't retry automatically
+        # — this avoids placing duplicate real sell orders on every subsequent
+        # tick.  The position will be resolved by cancel_market() at window close.
+        if key in self._sell_attempted:
+            logging.debug(
+                f"Skipping repeat sell attempt for {slug}:{side} "
+                f"(previous attempt failed)"
+            )
+            return
+
         token_id  = self._token(slug, side)
         positions = [p for p in self.get_positions(slug) if p.side == side]
         if not token_id or not positions:
@@ -418,6 +437,8 @@ class LiveTrader(PaperTrader):
             order_id = resp.get("orderID", "unknown")
         except Exception as exc:
             logging.error(f"SELL order failed ({side} @ ${sell_price:.2f}): {exc}")
+            # Mark so the main loop doesn't re-trigger on the next tick.
+            self._sell_attempted.add(key)
             return
 
         self._pending[key] = {"order_id": order_id, "type": "sell"}
@@ -431,6 +452,7 @@ class LiveTrader(PaperTrader):
         )
         super().execute_sell(slug, side, sell_price, reason, now)
         self._pending.pop(key, None)
+        self._sell_attempted.discard(key)  # clean up on success
 
     def _cancel_order(self, slug: str, side: str):
         key     = self._key(slug, side)
@@ -450,6 +472,8 @@ class LiveTrader(PaperTrader):
     def cancel_market(self, slug: str):
         """Cancel all open orders for this market window (called on close)."""
         for side in ("up", "down"):
+            # Clear any failed-sell flag so the next window starts clean.
+            self._sell_attempted.discard(self._key(slug, side))
             self._cancel_order(slug, side)
 
 
@@ -468,12 +492,15 @@ class LiveObserver(Observer):
     """
 
     def __init__(self, config: StrategyConfig, db_path: str, clob: ClobClient):
-        # Pass our LiveTrader in so Observer doesn't create a PaperTrader
+        # Build the trader first so it owns the single DB connection for this run.
         trader = LiveTrader(config, Database(db_path), clob)
+
+        # super().__init__ opens its own Database(db_path) and saves config to it.
+        # We close that connection immediately after and use trader.db instead,
+        # so only one SQLite connection is alive at a time.
         super().__init__(config, db_path, trader=trader)
-        # Replace the DB created by super().__init__ with the one LiveTrader holds
-        # (they share the same path so it's the same file; just keep one connection)
-        self.db     = trader.db
+        self.db.close()          # close the connection Observer just opened
+        self.db     = trader.db  # use the one LiveTrader already holds
         self.trader = trader
         self.ws     = PriceWebSocket()
 
@@ -548,8 +575,12 @@ def setup_keys(private_key: str, keys_file: str, chain_id: int = 137):
         "api_secret":     creds.api_secret,
         "api_passphrase": creds.api_passphrase,
     }
-    keys_path.write_text(json.dumps(data, indent=2))
-    keys_path.chmod(0o600)
+    # Open with mode 0o600 at creation time so there is no window where the
+    # file exists with world-readable permissions.  write_text() + chmod() has
+    # a TOCTOU race: the file is readable by others between the two calls.
+    fd = os.open(str(keys_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w") as f:
+        json.dump(data, f, indent=2)
 
     print(f"✅ Credentials saved to {keys_path}")
     print(f"   api_key: {creds.api_key[:16]}...")
@@ -592,6 +623,27 @@ def build_client(private_key: str, keys_file: str, chain_id: int = 137) -> "Clob
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
+
+def _warn_if_key_in_args(args) -> None:
+    """
+    Print a security warning if the private key was passed as a CLI argument
+    rather than via the POLYMARKET_PRIVATE_KEY environment variable.
+
+    CLI args are visible to all users on the machine via `ps aux` and are
+    stored in most shell histories.  The env-var path avoids both.
+    """
+    if not os.environ.get("POLYMARKET_PRIVATE_KEY") and args.private_key:
+        print(
+            "\n⚠️  Security warning: --private-key was passed as a command-line "
+            "argument.\n"
+            "   This is visible in `ps aux` output and may be saved in shell "
+            "history.\n"
+            "   Use the environment variable instead:\n\n"
+            "       export POLYMARKET_PRIVATE_KEY=0x...\n"
+            "       python trader.py\n",
+            file=sys.stderr,
+        )
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -677,6 +729,7 @@ Examples:
         if not args.private_key:
             print("Error: --private-key (or POLYMARKET_PRIVATE_KEY) required for --setup-keys")
             sys.exit(1)
+        _warn_if_key_in_args(args)
         setup_keys(args.private_key, args.keys_file, args.chain_id)
         return
 
@@ -688,6 +741,7 @@ Examples:
         )
         sys.exit(1)
 
+    _warn_if_key_in_args(args)
     clob = build_client(args.private_key, args.keys_file, args.chain_id)
 
     config = StrategyConfig(
