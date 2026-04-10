@@ -8,7 +8,15 @@ Two-file Python trading bot for Polymarket's BTC 5-minute up/down markets.
 
 ### The Strategy
 
-Buy UP or DOWN when ask ≤ 35-40¢. Wait for the market (not necessarily BTC itself) to reprice to 65-70¢ from retail sentiment overshoot, then sell. Never hold through resolution. Both sides can be held simultaneously in the same 5-min window. The edge is crowd psychology — BTC can move $10-20 and the market swings 30 cents.
+Buy DOWN when ask ≤ 40¢. Wait for the market to reprice to 65¢+ from retail sentiment overshoot, then sell. Never hold through resolution. The edge is crowd psychology — BTC can move $10-20 and the market swings 30 cents.
+
+**Why DOWN only:** Data from 8+ hours of paper trading showed DOWN outperforming consistently. Theory: whales can push BTC price up (buying pressure), but can't easily push it down — so DOWN overshoots are more organic and less manipulated. Running both sides causes UP losses to offset DOWN gains.
+
+**Current tuned parameters (`config_down.json`):**
+- Entry ≤ 0.40, Exit ≥ 0.65
+- Stop-loss at 0.15, only fires in final 20s AND only when BTC is moving *against* the position
+- Entry delay 5s (avoid first-tick noise)
+- BTC momentum filter $50 (skip DOWN entry if BTC has already moved up $50+ from window open)
 
 ### Files
 
@@ -16,9 +24,13 @@ Buy UP or DOWN when ask ≤ 35-40¢. Wait for the market (not necessarily BTC it
 |------|---------|
 | `observer.py` | Paper trading + data collection. No auth. Run this first. |
 | `trader.py` | Live trading. Imports from observer.py. Requires wallet + USDC. |
-| `requirements.txt` | `requests`, `py-clob-client`, `websockets` |
+| `dashboard.py` | Flask web UI — built but has bugs, not actively used. Run from terminal instead. |
+| `config_down.json` | Active config for Down Only bot |
+| `config.json` | Both Sides config (bot retired, kept for reference) |
+| `requirements.txt` | `requests`, `py-clob-client`, `websockets`, `flask` |
 | `CLAUDE.md` | Architecture reference for Claude Code |
-| `polymarket_observer.db` | SQLite DB (created on first run, shared by both scripts) |
+| `polymarket_down.db` | Active SQLite DB for Down Only bot |
+| `polymarket_observer.db` | SQLite DB for Both Sides bot (retired) |
 
 ---
 
@@ -184,6 +196,21 @@ paper_trades    simulated buy/sell: price, size, reason, pnl, bankroll_after
 live_trades     real orders: order_id, requested_price, filled_price (NULL), size_usdc, reason
 strategy_config last-used StrategyConfig as JSON (id=1 always)
 ```
+
+---
+
+## Key Logic: BTC Direction Guard on Stop-Loss
+
+Added in `evaluate_exit()` in `observer.py`. When the bid drops below `stop_loss` threshold, before firing the stop we check whether BTC is moving in our favor:
+
+```python
+btc_confirms = (side == "down" and btc_delta < 0) or \
+               (side == "up"   and btc_delta > 0)
+if not btc_confirms:
+    return "stop_loss"
+```
+
+If BTC is falling and we're holding DOWN, the price dip is likely mid-window noise — the market is still likely to resolve DOWN. Suppressing the stop here avoids getting shaken out of winning positions.
 
 ---
 
