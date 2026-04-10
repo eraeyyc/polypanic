@@ -98,6 +98,11 @@ class StrategyConfig:
     # 0 = disabled
     btc_momentum_threshold: float = 0.0
 
+    # Skip force_exit and let the market resolve if BTC has moved this many dollars
+    # in favor of our position (e.g. 15.0 = hold UP if BTC is up $15+ from open).
+    # 0 = disabled (always force_exit)
+    hold_through_close_btc_threshold: float = 0.0
+
     def to_dict(self):
         return asdict(self)
 
@@ -527,7 +532,7 @@ class PaperTrader:
         )
 
     def evaluate_exit(self, slug: str, side: str, best_bid: float,
-                      seconds_remaining: float) -> Optional[str]:
+                      seconds_remaining: float, btc_delta: float = 0.0) -> Optional[str]:
         if not self.has_position(slug, side):
             return None
         if best_bid >= self.config.exit_threshold:
@@ -535,6 +540,12 @@ class PaperTrader:
         if self.config.stop_loss > 0 and best_bid <= self.config.stop_loss:
             return "stop_loss"
         if seconds_remaining <= self.config.force_exit_before_close_secs:
+            t = self.config.hold_through_close_btc_threshold
+            if t > 0:
+                if side == "up"   and btc_delta >=  t:
+                    return None  # BTC strongly up — let UP resolve at $1.00
+                if side == "down" and btc_delta <= -t:
+                    return None  # BTC strongly down — let DOWN resolve at $1.00
             return "force_exit"
         return None
 
@@ -758,7 +769,8 @@ class Observer:
                     # Exits first, then entries
                     for side, prices in (("up", up_prices), ("down", down_prices)):
                         reason = self.trader.evaluate_exit(
-                            slug, side, prices["best_bid"], seconds_remaining
+                            slug, side, prices["best_bid"], seconds_remaining,
+                            btc_delta=btc_delta
                         )
                         if reason:
                             self.trader._exit_signal = {
@@ -985,6 +997,7 @@ def main():
     parser.add_argument("--single-side",    action="store_true",    help="Only one position per market")
     parser.add_argument("--entry-delay",    type=int,   default=0,  help="Seconds to wait before first buy (default 0)")
     parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
+    parser.add_argument("--hold-threshold", type=float, default=0.0, help="Hold through close if BTC moved $X in your favor (0=off)")
     parser.add_argument("--log-level",      default="INFO")
     args = parser.parse_args()
 
@@ -1018,6 +1031,7 @@ def main():
         allow_both_sides=not args.single_side,
         entry_delay_secs=args.entry_delay,
         btc_momentum_threshold=args.btc_momentum,
+        hold_through_close_btc_threshold=args.hold_threshold,
     )
     Observer(config, db_path=args.db).run()
 
