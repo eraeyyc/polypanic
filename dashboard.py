@@ -352,9 +352,10 @@ HTML = """
       const holdDn = positions.some(p => p.side === "down");
 
       // Seconds remaining styling
-      let secsClass = "secs-ok";
-      if (t.secs <= 30) secsClass = "secs-danger";
-      else if (t.secs <= 60) secsClass = "secs-warn";
+      let secsClass = "tick-secs secs-ok";
+      if (t.secs == null)    secsClass = "tick-secs secs-ok";
+      else if (t.secs <= 30) secsClass = "tick-secs secs-danger";
+      else if (t.secs <= 60) secsClass = "tick-secs secs-warn";
 
       // BTC delta
       let btcDeltaHtml = "";
@@ -378,7 +379,7 @@ HTML = """
 
       return `<div class="tick">
         <span class="tick-time">${t.time}</span>
-        <span class="${secsClass}">[${t.secs}s]</span>
+        <span class="${secsClass}">[${t.secs != null ? t.secs : "?"}s]</span>
         <span class="tick-btc">${fmtBtc(t.btc)}${btcDeltaHtml}</span>
         <span class="tick-divider">│</span>
         <span class="tick-side">
@@ -434,6 +435,29 @@ HTML = """
             const diff = data.bankroll - data.starting_bankroll;
             bEl.textContent = "$" + data.bankroll.toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:2});
             bEl.className = "bot-bankroll " + (diff > 0 ? "up" : diff < 0 ? "down" : "flat");
+          }
+
+          // Update stats grid
+          const s = data.stats;
+          if (s) {
+            const sEl = document.getElementById(`stats-${botId}`);
+            if (sEl) {
+              const pnlCls = s.total_pnl >= 0 ? "up" : "down";
+              const sign = v => (v >= 0 ? "+" : "") + v.toFixed(2);
+              sEl.innerHTML = `
+                <div class="stat"><div class="stat-label">Total P&L</div>
+                  <div class="stat-value ${pnlCls}">${sign(s.total_pnl)}</div></div>
+                <div class="stat"><div class="stat-label">Win rate</div>
+                  <div class="stat-value">${s.win_rate}%</div></div>
+                <div class="stat"><div class="stat-label">Trades</div>
+                  <div class="stat-value">${s.total_sells}</div></div>
+                <div class="stat"><div class="stat-label">exit_target</div>
+                  <div class="stat-value up">${sign(s.exit_target_pnl)}</div></div>
+                <div class="stat"><div class="stat-label">force_exit</div>
+                  <div class="stat-value down">${sign(s.force_exit_pnl)}</div></div>
+                <div class="stat"><div class="stat-label">stop_loss</div>
+                  <div class="stat-value down">${sign(s.stop_loss_pnl)}</div></div>`;
+            }
           }
 
           // Update trades table
