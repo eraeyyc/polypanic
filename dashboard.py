@@ -639,7 +639,7 @@ def ticks(bot_id):
         SELECT timestamp, seconds_remaining,
                up_best_ask, up_best_bid,
                down_best_ask, down_best_bid,
-               btc_spot, btc_delta_from_open, price_source
+               btc_spot_price, btc_delta_from_open, price_source
         FROM price_ticks WHERE slug = ?
         ORDER BY timestamp DESC LIMIT 50
     """, (slug,)).fetchall()
@@ -671,7 +671,7 @@ def ticks(bot_id):
             "up_bid":    t["up_best_bid"],
             "dn_ask":    t["down_best_ask"],
             "dn_bid":    t["down_best_bid"],
-            "btc":       t["btc_spot"],
+            "btc":       t["btc_spot_price"],
             "btc_delta": t["btc_delta_from_open"],
             "src":       t["price_source"],
         }
