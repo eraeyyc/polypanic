@@ -1,4 +1,0 @@
-requests
-py-clob-client
-websockets
-flask

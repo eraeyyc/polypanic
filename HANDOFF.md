@@ -147,6 +147,35 @@ python trader.py --entry 0.38 --exit 0.68 --max-position 50
 
 ---
 
+## Changes Made (2026-04-10)
+
+### Strategy / ROI fixes
+
+Analysis of 57 observed markets revealed two major ROI drains:
+
+**1. Stop-loss was firing too late due to REST polling latency.**
+The stop_loss was configured at 0.20 but the 3-second poll interval meant actual fill prices were 0.07–0.10 (near-zero). Combined with the strategy thesis ("markets overshoot, then reprice"), an immediate stop_loss directly contradicts the edge. Changed:
+- `StrategyConfig.stop_loss_after_secs` default: `0` → `60` (only fires in final 60s of window)
+- CLI default for `--stop-loss-after` updated to match in both `observer.py` and `trader.py`
+
+**2. No minimum entry price floor.**
+Entries at sub-0.15 prices (markets already nearly resolved) were 100% losing trades. Added:
+- `StrategyConfig.min_entry_price = 0.15` — new field, `evaluate_entry` rejects any ask below this
+- `--min-entry` CLI flag added to both scripts (default 0.15, pass 0 to disable)
+
+### Database / performance fixes
+
+- **WAL mode** — `PRAGMA journal_mode=WAL` + `synchronous=NORMAL` on every new connection. Faster writes, concurrent reads don't block.
+- **Composite index** — `idx_ticks_slug_ts ON price_ticks(slug, timestamp)` added. The swing analysis correlated subqueries were doing full scans; this covers them.
+- **Batched tick commits** — `insert_tick` no longer commits after every row. Commits every 10 ticks via `_pending_ticks` counter. `flush_ticks()` added and called at window close and shutdown. Trade/market inserts still commit immediately.
+
+### Code quality fixes
+
+- **`price_source` now accurate** — `_get_prices()` return type changed from 2-tuple to 3-tuple `(up, down, source)`. Base observer returns `"rest"`; `LiveObserver` returns `"ws"` when WebSocket data is used. The `price_source` column was previously always `'rest'` even in live mode.
+- **`_entry_signal`/`_exit_signal` removed** — These were instance variables set immediately before calling `execute_buy`/`execute_sell` as a side-channel for passing context. Replaced with an explicit `context: Optional[dict]` parameter on both methods. Thread-safe and readable.
+
+---
+
 ## What Still Needs to Be Done
 
 ### Must-do before trusting live trading
@@ -180,8 +209,6 @@ python trader.py --entry 0.38 --exit 0.68 --max-position 50
 6. **Paper mode in trader.py** — Add `--paper` flag to `trader.py` that uses WebSocket prices but `PaperTrader` for execution. Faster paper testing than `observer.py`'s 3s REST polling since WebSocket gives sub-second updates.
 
 7. **README.md update** — Currently describes the old single-file architecture. Needs updating for the two-file split and `trader.py` setup instructions.
-
-8. **`price_source` column in ticks** — The DB schema has a `price_source` column (`'rest'` or `'ws'`) but `LiveObserver` always writes `'rest'`. Pass the source through `_get_prices()` return value so WebSocket ticks are tagged correctly for analysis.
 
 ---
 

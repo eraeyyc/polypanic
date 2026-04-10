@@ -105,8 +105,15 @@ class StrategyConfig:
 
     # Only activate stop_loss when fewer than this many seconds remain in the window.
     # Prevents cutting a position that still has time to recover.
-    # 0 = stop_loss fires immediately regardless of time remaining
-    stop_loss_after_secs: int = 0
+    # Default 60: stop_loss only fires in the last 60 seconds so positions have
+    # time to reprice before being cut.  0 = fires immediately regardless of time.
+    stop_loss_after_secs: int = 60
+
+    # Reject entry if best ask is below this price.
+    # Prices below ~0.15 mean the crowd has already priced this side as near-dead —
+    # recovery to the exit threshold is unlikely and buying here contradicts the
+    # sentiment-overshoot thesis.
+    min_entry_price: float = 0.15
 
     # Restrict entries to one side only: "up", "down", or "" for both
     only_side: str = ""
@@ -289,6 +296,13 @@ class Database:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # WAL mode: concurrent reads don't block writes; much faster for
+        # high-frequency tick inserts alongside occasional analysis queries.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        # NORMAL sync is safe with WAL (no data loss on OS crash, only power loss)
+        # and avoids the full fsync on every commit.
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self._pending_ticks = 0
         self._create_tables()
 
     def _create_tables(self):
@@ -358,6 +372,7 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_ticks_slug       ON price_ticks(slug);
             CREATE INDEX IF NOT EXISTS idx_ticks_time       ON price_ticks(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_ticks_slug_ts    ON price_ticks(slug, timestamp);
             CREATE INDEX IF NOT EXISTS idx_trades_slug      ON paper_trades(slug);
             CREATE INDEX IF NOT EXISTS idx_live_trades_slug ON live_trades(slug);
         """)
@@ -435,7 +450,20 @@ class Database:
               down_bid, down_ask, down_mid,
               btc_spot, btc_delta, source,
               up_spread, down_spread, up_change_10s, down_change_10s))
-        self.conn.commit()
+        # Batch commits: flush every 10 ticks rather than every insert.
+        # With WebSocket at sub-second cadence this avoids fsyncing constantly.
+        # Trades and market updates still commit immediately (see insert_trade,
+        # upsert_market) so financial records are never batched.
+        self._pending_ticks += 1
+        if self._pending_ticks >= 10:
+            self.conn.commit()
+            self._pending_ticks = 0
+
+    def flush_ticks(self):
+        """Force-commit any buffered tick inserts. Call on market close or shutdown."""
+        if self._pending_ticks > 0:
+            self.conn.commit()
+            self._pending_ticks = 0
 
     # ── Paper trades ──────────────────────────────────────────────────────────
 
@@ -520,6 +548,8 @@ class PaperTrader:
             return False
         if best_ask <= 0 or best_ask > self.config.entry_threshold:
             return False
+        if best_ask < self.config.min_entry_price:
+            return False
         if best_ask - best_bid > self.config.max_entry_spread:
             return False
         if seconds_remaining < self.config.min_time_remaining_secs:
@@ -541,21 +571,20 @@ class PaperTrader:
             return False
         return True
 
-    def execute_buy(self, slug: str, side: str, price: float, now: float):
+    def execute_buy(self, slug: str, side: str, price: float, now: float,
+                    context: Optional[dict] = None):
         size   = min(self.config.max_position_size, self.bankroll)
         shares = size / price
         pos    = Position(side=side, entry_price=price, size=size,
                           shares=shares, entry_time=now)
         self.positions.setdefault(slug, {})[side] = pos
         self.bankroll -= size
-        ctx = getattr(self, '_entry_signal', None)
-        self._entry_signal = None
         self.db.insert_trade(
             slug, now, side, "buy", price, size, "entry", 0, self.bankroll,
             shares=shares,
-            seconds_remaining=ctx.get("seconds_remaining") if ctx else None,
-            spread_at_trade=ctx.get("spread") if ctx else None,
-            signal_json=json.dumps(ctx) if ctx else None,
+            seconds_remaining=context.get("seconds_remaining") if context else None,
+            spread_at_trade=context.get("spread") if context else None,
+            signal_json=json.dumps(context) if context else None,
         )
         logging.info(
             f"📗 PAPER BUY  {side.upper()} @ ${price:.2f} | "
@@ -587,7 +616,7 @@ class PaperTrader:
         return None
 
     def execute_sell(self, slug: str, side: str, price: float,
-                     reason: str, now: float):
+                     reason: str, now: float, context: Optional[dict] = None):
         pos_map = self.positions.get(slug, {})
         if side not in pos_map:
             return
@@ -596,14 +625,12 @@ class PaperTrader:
         pnl      = proceeds - pos.size
         self.bankroll += proceeds
         del self.positions[slug][side]
-        ctx = getattr(self, '_exit_signal', None)
-        self._exit_signal = None
         self.db.insert_trade(
             slug, now, side, "sell", price, proceeds, reason, pnl, self.bankroll,
             shares=pos.shares,
-            seconds_remaining=ctx.get("seconds_remaining") if ctx else None,
-            spread_at_trade=ctx.get("spread") if ctx else None,
-            signal_json=json.dumps(ctx) if ctx else None,
+            seconds_remaining=context.get("seconds_remaining") if context else None,
+            spread_at_trade=context.get("spread") if context else None,
+            signal_json=json.dumps(context) if context else None,
         )
         if reason == "stop_loss":
             self._stopped_out.setdefault(slug, set()).add(side)
@@ -674,11 +701,13 @@ class Observer:
         """Called once per market window after tokens are resolved. No-op by default."""
         pass
 
-    def _get_prices(self, tokens: dict) -> tuple[Optional[dict], Optional[dict]]:
-        """Fetch current bid/ask for both sides. Override to use WebSocket."""
+    def _get_prices(self, tokens: dict) -> tuple[Optional[dict], Optional[dict], str]:
+        """Fetch current bid/ask for both sides. Override to use WebSocket.
+        Returns (up_prices, down_prices, source) where source is 'rest' or 'ws'."""
         return (
             self.poly.get_price(tokens["up_token_id"]),
             self.poly.get_price(tokens["down_token_id"]),
+            "rest",
         )
 
     # ── Main loop ─────────────────────────────────────────────────────────────
@@ -766,7 +795,7 @@ class Observer:
                     time.sleep(0.5)
                     continue
 
-                up_prices, down_prices = self._get_prices(self._current_tokens)
+                up_prices, down_prices, price_source = self._get_prices(self._current_tokens)
                 btc_now = self.btc.get_btc_price()
 
                 if up_prices and down_prices:
@@ -786,7 +815,7 @@ class Observer:
                         slug, now, seconds_remaining,
                         up_prices["best_bid"],   up_prices["best_ask"],   up_mid,
                         down_prices["best_bid"], down_prices["best_ask"], down_mid,
-                        btc_now, btc_delta,
+                        btc_now, btc_delta, price_source,
                         up_spread=up_spread, down_spread=down_spread,
                         up_change_10s=up_change_10s, down_change_10s=down_change_10s,
                     )
@@ -814,14 +843,17 @@ class Observer:
                             btc_delta=btc_delta
                         )
                         if reason:
-                            self.trader._exit_signal = {
+                            exit_ctx = {
                                 "seconds_remaining": round(seconds_remaining, 1),
                                 "spread": round(prices["best_ask"] - prices["best_bid"], 4),
                                 "up_mid": round(up_mid, 4),
                                 "down_mid": round(down_mid, 4),
                                 "btc_delta": round(btc_delta, 2),
                             }
-                            self.trader.execute_sell(slug, side, prices["best_bid"], reason, now)
+                            self.trader.execute_sell(
+                                slug, side, prices["best_bid"], reason, now,
+                                context=exit_ctx,
+                            )
 
                     elapsed_secs = 300 - seconds_remaining
 
@@ -830,7 +862,7 @@ class Observer:
                             slug, side, prices["best_ask"], prices["best_bid"],
                             seconds_remaining, btc_delta=btc_delta, elapsed_secs=elapsed_secs
                         ):
-                            self.trader._entry_signal = {
+                            entry_ctx = {
                                 "seconds_remaining": round(seconds_remaining, 1),
                                 "spread": round(prices["best_ask"] - prices["best_bid"], 4),
                                 "up_mid": round(up_mid, 4),
@@ -839,7 +871,10 @@ class Observer:
                                 "up_change_10s": up_change_10s,
                                 "down_change_10s": down_change_10s,
                             }
-                            self.trader.execute_buy(slug, side, prices["best_ask"], now)
+                            self.trader.execute_buy(
+                                slug, side, prices["best_ask"], now,
+                                context=entry_ctx,
+                            )
 
                 time.sleep(self.config.poll_interval_secs)
 
@@ -851,11 +886,13 @@ class Observer:
 
         if last_slug:
             self._finalize_market(last_slug)
+        self.db.flush_ticks()
         self._print_summary()
         self.db.close()
 
     def _finalize_market(self, slug: str):
         """Resolve any open positions when a window closes."""
+        self.db.flush_ticks()  # commit any buffered ticks before closing the window
         btc_close = self.btc.get_btc_price()
         row = self.db.conn.execute(
             "SELECT btc_open_price FROM markets WHERE slug=?", (slug,)
@@ -1039,7 +1076,8 @@ def main():
     parser.add_argument("--entry-delay",    type=int,   default=0,  help="Seconds to wait before first buy (default 0)")
     parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
     parser.add_argument("--hold-threshold",    type=float, default=0.0, help="Hold through close if BTC moved $X in your favor (0=off)")
-    parser.add_argument("--stop-loss-after",   type=int,   default=0,  help="Only trigger stop_loss in final N seconds of window (0=anytime)")
+    parser.add_argument("--stop-loss-after",   type=int,   default=60, help="Only trigger stop_loss in final N seconds of window (default 60, 0=anytime)")
+    parser.add_argument("--min-entry",         type=float, default=0.15, help="Reject entries below this price (default 0.15, 0=disabled)")
     parser.add_argument("--only-side",         default="", choices=["", "up", "down"], help="Restrict entries to one side only")
     parser.add_argument("--log-level",      default="INFO")
     args = parser.parse_args()
@@ -1076,6 +1114,7 @@ def main():
         btc_momentum_threshold=args.btc_momentum,
         hold_through_close_btc_threshold=args.hold_threshold,
         stop_loss_after_secs=args.stop_loss_after,
+        min_entry_price=args.min_entry,
         only_side=args.only_side,
     )
     Observer(config, db_path=args.db).run()

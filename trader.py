@@ -356,7 +356,8 @@ class LiveTrader(PaperTrader):
 
     # ── Order placement ───────────────────────────────────────────────────────
 
-    def execute_buy(self, slug: str, side: str, price: float, now: float):
+    def execute_buy(self, slug: str, side: str, price: float, now: float,
+                    context=None):
         token_id = self._token(slug, side)
         if not token_id:
             logging.error(f"No token registered for {slug}:{side}")
@@ -390,10 +391,10 @@ class LiveTrader(PaperTrader):
         # Update local state optimistically — assumes fill at the ask price.
         # If the order doesn't fill (e.g., price moved away), it will be
         # cancelled by cancel_market() when the window closes.
-        super().execute_buy(slug, side, price, now)
+        super().execute_buy(slug, side, price, now, context=context)
 
     def execute_sell(self, slug: str, side: str, price: float,
-                     reason: str, now: float):
+                     reason: str, now: float, context=None):
         key     = self._key(slug, side)
         pending = self._pending.get(key)
 
@@ -450,7 +451,7 @@ class LiveTrader(PaperTrader):
             f"🔴 LIVE SELL {side.upper()} @ ${sell_price:.2f} | "
             f"reason={reason} | id={order_id[:16]}..."
         )
-        super().execute_sell(slug, side, sell_price, reason, now)
+        super().execute_sell(slug, side, sell_price, reason, now, context=context)
         self._pending.pop(key, None)
         self._sell_attempted.discard(key)  # clean up on success
 
@@ -517,13 +518,14 @@ class LiveObserver(Observer):
         up_ws = self.ws.get_prices(tokens["up_token_id"])
         dn_ws = self.ws.get_prices(tokens["down_token_id"])
         if up_ws and dn_ws:
-            return up_ws, dn_ws
+            return up_ws, dn_ws, "ws"
         # WebSocket data stale or not yet connected — fall back to REST
         if up_ws or dn_ws:
             logging.debug("Partial WebSocket data, falling back to REST")
         return (
             self.poly.get_price(tokens["up_token_id"]),
             self.poly.get_price(tokens["down_token_id"]),
+            "rest",
         )
 
     def _finalize_market(self, slug: str):
@@ -691,6 +693,10 @@ Examples:
     parser.add_argument("--entry",        type=float, default=0.40)
     parser.add_argument("--exit",         type=float, default=0.65)
     parser.add_argument("--stop-loss",    type=float, default=0.0)
+    parser.add_argument("--stop-loss-after", type=int, default=60,
+                        help="Only trigger stop_loss in final N seconds of window (default 60, 0=anytime)")
+    parser.add_argument("--min-entry",    type=float, default=0.15,
+                        help="Reject entries below this price (default 0.15, 0=disabled)")
     parser.add_argument("--max-position", type=float, default=50.0,
                         help="Max USDC per side per market (default: 50)")
     parser.add_argument("--min-position", type=float, default=5.0,
@@ -748,6 +754,8 @@ Examples:
         entry_threshold          = args.entry,
         exit_threshold           = args.exit,
         stop_loss                = args.stop_loss,
+        stop_loss_after_secs     = args.stop_loss_after,
+        min_entry_price          = args.min_entry,
         max_position_size        = args.max_position,
         min_position_usdc        = args.min_position,
         starting_bankroll        = args.bankroll,
