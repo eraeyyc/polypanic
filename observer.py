@@ -741,6 +741,7 @@ class Observer:
                     self._current_tokens        = tokens
                     self._current_btc_open      = btc_open
                     self._window_start_bankroll = self.trader.bankroll
+                    self.trader._stopped_out.clear()
 
                     # Notify subclasses (WebSocket subscription, LiveTrader registration, etc.)
                     self._on_new_market(slug, tokens)

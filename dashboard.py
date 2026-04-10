@@ -11,6 +11,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from flask import Flask, redirect, render_template_string, request
@@ -421,6 +422,19 @@ def stop(bot_id):
     if pid:
         try:
             os.kill(pid, signal.SIGTERM)
+            # Wait up to 5 seconds for the process to exit cleanly
+            for _ in range(10):
+                time.sleep(0.5)
+                try:
+                    os.kill(pid, 0)  # still alive?
+                except ProcessLookupError:
+                    break  # gone
+            else:
+                # Still alive after 5s — force kill
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         except ProcessLookupError:
             pass
         (BASE / bot["pid_file"]).unlink(missing_ok=True)
