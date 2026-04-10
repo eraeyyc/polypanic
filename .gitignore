@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Secrets & credentials
+.env
+.env.*
+*.env
+keys.json
+*_keys.json
+*credentials*.json
+secrets/
+
+# Local data (can be large, machine-specific)
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+
+# Dashboard runtime files
+.observer*.pid
+
+# macOS
+.DS_Store

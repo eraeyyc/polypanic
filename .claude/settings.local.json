@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 --version)",
+      "Bash(pip3 show:*)",
+      "Bash(pip3 install:*)",
+      "Bash(chmod +x:*)",
+      "Bash(sqlite3:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}
