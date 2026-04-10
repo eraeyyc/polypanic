@@ -697,6 +697,10 @@ Examples:
                         help="Only trigger stop_loss in final N seconds of window (default 60, 0=anytime)")
     parser.add_argument("--min-entry",    type=float, default=0.15,
                         help="Reject entries below this price (default 0.15, 0=disabled)")
+    parser.add_argument("--hold-threshold", type=float, default=15.0,
+                        help="Hold through close if BTC moved $X in your favor (default 15.0, 0=off)")
+    parser.add_argument("--cooldown",     type=int,   default=10,
+                        help="Seconds to block re-entry after a sell (default 10, 0=off)")
     parser.add_argument("--max-position", type=float, default=50.0,
                         help="Max USDC per side per market (default: 50)")
     parser.add_argument("--min-position", type=float, default=5.0,
@@ -754,9 +758,11 @@ Examples:
         entry_threshold          = args.entry,
         exit_threshold           = args.exit,
         stop_loss                = args.stop_loss,
-        stop_loss_after_secs     = args.stop_loss_after,
-        min_entry_price          = args.min_entry,
-        max_position_size        = args.max_position,
+        stop_loss_after_secs              = args.stop_loss_after,
+        min_entry_price                   = args.min_entry,
+        hold_through_close_btc_threshold  = args.hold_threshold,
+        post_sell_cooldown_secs           = args.cooldown,
+        max_position_size                 = args.max_position,
         min_position_usdc        = args.min_position,
         starting_bankroll        = args.bankroll,
         allow_both_sides         = not args.single_side,

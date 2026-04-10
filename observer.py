@@ -101,7 +101,7 @@ class StrategyConfig:
     # Skip force_exit and let the market resolve if BTC has moved this many dollars
     # in favor of our position (e.g. 15.0 = hold UP if BTC is up $15+ from open).
     # 0 = disabled (always force_exit)
-    hold_through_close_btc_threshold: float = 0.0
+    hold_through_close_btc_threshold: float = 15.0
 
     # Only activate stop_loss when fewer than this many seconds remain in the window.
     # Prevents cutting a position that still has time to recover.
@@ -114,6 +114,12 @@ class StrategyConfig:
     # recovery to the exit threshold is unlikely and buying here contradicts the
     # sentiment-overshoot thesis.
     min_entry_price: float = 0.15
+
+    # Seconds to block re-entry on a side after selling it.
+    # Prevents the bot from immediately flipping back into the same side
+    # right after an exit — a pattern that has historically lost money.
+    # 0 = no cooldown (re-entry allowed immediately)
+    post_sell_cooldown_secs: int = 10
 
     # Restrict entries to one side only: "up", "down", or "" for both
     only_side: str = ""
@@ -524,6 +530,7 @@ class PaperTrader:
         self.bankroll = config.starting_bankroll
         self.positions: dict[str, dict[str, Position]] = {}  # slug → {side → Position}
         self._stopped_out: dict[str, set] = {}  # slug → set of sides stopped out this window
+        self._last_sell_time: dict[str, dict[str, float]] = {}  # slug → {side → timestamp}
         self._load_bankroll()
 
     def _load_bankroll(self):
@@ -544,6 +551,10 @@ class PaperTrader:
                        btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> bool:
         if side in self._stopped_out.get(slug, set()):
             return False
+        if self.config.post_sell_cooldown_secs > 0:
+            last_sell = self._last_sell_time.get(slug, {}).get(side, 0.0)
+            if time.time() - last_sell < self.config.post_sell_cooldown_secs:
+                return False
         if self.config.only_side and side != self.config.only_side:
             return False
         if best_ask <= 0 or best_ask > self.config.entry_threshold:
@@ -634,6 +645,7 @@ class PaperTrader:
         )
         if reason == "stop_loss":
             self._stopped_out.setdefault(slug, set()).add(side)
+        self._last_sell_time.setdefault(slug, {})[side] = now
 
         emoji = "📈" if pnl > 0 else "📉"
         logging.info(
@@ -1075,7 +1087,8 @@ def main():
     parser.add_argument("--single-side",    action="store_true",    help="Only one position per market")
     parser.add_argument("--entry-delay",    type=int,   default=0,  help="Seconds to wait before first buy (default 0)")
     parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
-    parser.add_argument("--hold-threshold",    type=float, default=0.0, help="Hold through close if BTC moved $X in your favor (0=off)")
+    parser.add_argument("--hold-threshold",    type=float, default=15.0, help="Hold through close if BTC moved $X in your favor (default 15.0, 0=off)")
+    parser.add_argument("--cooldown",          type=int,   default=10,  help="Seconds to block re-entry after a sell (default 10, 0=off)")
     parser.add_argument("--stop-loss-after",   type=int,   default=60, help="Only trigger stop_loss in final N seconds of window (default 60, 0=anytime)")
     parser.add_argument("--min-entry",         type=float, default=0.15, help="Reject entries below this price (default 0.15, 0=disabled)")
     parser.add_argument("--only-side",         default="", choices=["", "up", "down"], help="Restrict entries to one side only")
@@ -1115,6 +1128,7 @@ def main():
         hold_through_close_btc_threshold=args.hold_threshold,
         stop_loss_after_secs=args.stop_loss_after,
         min_entry_price=args.min_entry,
+        post_sell_cooldown_secs=args.cooldown,
         only_side=args.only_side,
     )
     Observer(config, db_path=args.db).run()
