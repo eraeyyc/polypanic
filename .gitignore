@@ -23,5 +23,8 @@ secrets/
 # Logs
 *.log
 
+# Dashboard runtime files
+.observer.pid
+
 # macOS
 .DS_Store

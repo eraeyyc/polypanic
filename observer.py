@@ -103,6 +103,11 @@ class StrategyConfig:
     # 0 = disabled (always force_exit)
     hold_through_close_btc_threshold: float = 0.0
 
+    # Only activate stop_loss when fewer than this many seconds remain in the window.
+    # Prevents cutting a position that still has time to recover.
+    # 0 = stop_loss fires immediately regardless of time remaining
+    stop_loss_after_secs: int = 0
+
     def to_dict(self):
         return asdict(self)
 
@@ -487,6 +492,7 @@ class PaperTrader:
         self.db = db
         self.bankroll = config.starting_bankroll
         self.positions: dict[str, dict[str, Position]] = {}  # slug → {side → Position}
+        self._stopped_out: dict[str, set] = {}  # slug → set of sides stopped out this window
         self._load_bankroll()
 
     def _load_bankroll(self):
@@ -505,6 +511,8 @@ class PaperTrader:
     def evaluate_entry(self, slug: str, side: str, best_ask: float,
                        best_bid: float, seconds_remaining: float,
                        btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> bool:
+        if side in self._stopped_out.get(slug, set()):
+            return False
         if best_ask <= 0 or best_ask > self.config.entry_threshold:
             return False
         if best_ask - best_bid > self.config.max_entry_spread:
@@ -556,7 +564,9 @@ class PaperTrader:
         if best_bid >= self.config.exit_threshold:
             return "exit_target"
         if self.config.stop_loss > 0 and best_bid <= self.config.stop_loss:
-            return "stop_loss"
+            if self.config.stop_loss_after_secs == 0 or \
+               seconds_remaining <= self.config.stop_loss_after_secs:
+                return "stop_loss"
         if seconds_remaining <= self.config.force_exit_before_close_secs:
             t = self.config.hold_through_close_btc_threshold
             if t > 0:
@@ -586,6 +596,9 @@ class PaperTrader:
             spread_at_trade=ctx.get("spread") if ctx else None,
             signal_json=json.dumps(ctx) if ctx else None,
         )
+        if reason == "stop_loss":
+            self._stopped_out.setdefault(slug, set()).add(side)
+
         emoji = "📈" if pnl > 0 else "📉"
         logging.info(
             f"{emoji} PAPER SELL {side.upper()} @ ${price:.2f} | "
@@ -1015,7 +1028,8 @@ def main():
     parser.add_argument("--single-side",    action="store_true",    help="Only one position per market")
     parser.add_argument("--entry-delay",    type=int,   default=0,  help="Seconds to wait before first buy (default 0)")
     parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
-    parser.add_argument("--hold-threshold", type=float, default=0.0, help="Hold through close if BTC moved $X in your favor (0=off)")
+    parser.add_argument("--hold-threshold",    type=float, default=0.0, help="Hold through close if BTC moved $X in your favor (0=off)")
+    parser.add_argument("--stop-loss-after",   type=int,   default=0,  help="Only trigger stop_loss in final N seconds of window (0=anytime)")
     parser.add_argument("--log-level",      default="INFO")
     args = parser.parse_args()
 
@@ -1050,6 +1064,7 @@ def main():
         entry_delay_secs=args.entry_delay,
         btc_momentum_threshold=args.btc_momentum,
         hold_through_close_btc_threshold=args.hold_threshold,
+        stop_loss_after_secs=args.stop_loss_after,
     )
     Observer(config, db_path=args.db).run()
 
