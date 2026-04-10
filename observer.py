@@ -201,7 +201,25 @@ class PolymarketClient:
 
 
 class BTCPriceClient:
-    """Multi-source BTC/USD spot price with automatic fallback."""
+    """Multi-source BTC/USD spot price with automatic fallback.
+
+    NOTE — resolution price mismatch:
+    Polymarket resolves BTC 5-min markets using Chainlink Data Streams
+    (feed ID 0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8).
+    Data Streams is a paid subscription product — we do not have access to it.
+
+    This client uses Coinbase/Kraken/Binance/CoinGecko spot prices instead.
+    Spot can diverge from the Chainlink oracle price, which means:
+      - btc_open_price and btc_close_price in the DB may not match Polymarket's
+        resolution source exactly
+      - _finalize_market() resolution predictions (up/down) can be wrong
+      - --hold-threshold logic is unreliable because the price we're reading
+        is not the price the market resolves against
+
+    This is acceptable for paper trading and strategy validation. Before going
+    live, evaluate Chainlink Data Streams pricing at:
+    https://chain.link/contact?ref_id=datastreams
+    """
 
     def __init__(self):
         self.session = requests.Session()

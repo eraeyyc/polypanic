@@ -22,6 +22,23 @@
 ./run.sh observer.py --stop-loss 0.10 --entry-delay 5 --btc-momentum 30 --hold-threshold 15
 ```
 
+## Known limitation — BTC price source mismatch
+
+Polymarket resolves BTC 5-min markets using **Chainlink Data Streams** (feed ID `0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8`). Data Streams is a paid subscription product — we don't have access.
+
+The bot currently uses Coinbase/Kraken/Binance/CoinGecko spot prices instead. Consequences:
+- Resolution direction predictions in `_finalize_market()` can be wrong
+- `--hold-threshold` is unreliable — the price we read is not the price Polymarket resolves against
+- `btc_open_price` / `btc_close_price` in the DB may not match Polymarket's oracle exactly
+
+**For paper trading this is acceptable.** Before going live, get a Data Streams quote: https://chain.link/contact?ref_id=datastreams
+
+Because of the above, drop `--hold-threshold` from the run command until we have reliable resolution data:
+
+```bash
+./run.sh observer.py --stop-loss 0.10 --entry-delay 5 --btc-momentum 30
+```
+
 ## What's broken / not yet tested
 
 - Live trading not tested against mainnet
@@ -32,6 +49,7 @@
 ## What's next
 
 - Run paper trader for several days with the new flags and compare P&L vs baseline
-- Tune `--btc-momentum` and `--hold-threshold` based on observed data
+- Tune `--btc-momentum` based on observed data
 - Check `--analyze` output after 100+ markets to see if hit rate improves
 - Consider adding a max-loss-per-session cutoff to protect bankroll
+- Evaluate Chainlink Data Streams cost before going live
