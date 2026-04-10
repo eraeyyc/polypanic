@@ -571,7 +571,11 @@ class PaperTrader:
         if self.config.stop_loss > 0 and best_bid <= self.config.stop_loss:
             if self.config.stop_loss_after_secs == 0 or \
                seconds_remaining <= self.config.stop_loss_after_secs:
-                return "stop_loss"
+                # Don't stop out if BTC is moving in our favor — dip may be temporary
+                btc_confirms = (side == "down" and btc_delta < 0) or \
+                               (side == "up"   and btc_delta > 0)
+                if not btc_confirms:
+                    return "stop_loss"
         if seconds_remaining <= self.config.force_exit_before_close_secs:
             t = self.config.hold_through_close_btc_threshold
             if t > 0:
