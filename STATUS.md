@@ -2,175 +2,66 @@
 
 **Last updated:** 2026-04-11
 
-## Current paper-trading setup
+## Current live setup
 
-The current paper baseline is the filtered single-side strategy that performed better on the fresh DB:
+Live trading is confirmed working end-to-end. Run with real strategy parameters:
 
 ```bash
-caffeinate -i ./run.sh observer.py \
+caffeinate -i python trader.py \
   --entry 0.38 \
   --exit 0.70 \
   --entry-delay 60 \
   --max-entry-age 150 \
   --min-entry 0.15 \
-  --db polymarket_observer_v2.db
+  --max-position 5 \
+  --bankroll 20 \
+  --db polymarket_live.db
 ```
 
-Expected startup banner for the patched observer:
+Scale up `--max-position` and `--bankroll` once you've seen several clean cycles.
 
-```text
-Entry:    ≤ $0.38
-Exit:     ≥ $0.70
-Sides:    one
-Window:   +60s to +150s
-BTC dir:  aligned only
-```
+## What changed in the 2026-04-11 (evening) session
 
-## What changed in the 2026-04-11 session
+### Live trading confirmed
 
-### Live trader hardening
+- Signature error (`400 invalid signature`) from earlier session is gone — auth flow is working.
+- Ran a smoke test with loose settings (`--entry 0.90 --exit 0.95 --allow-contrarian`) to force a trade.
+- Confirmed fills, fee tracking, and realized P&L all working correctly.
+- Polymarket balance went from $17 deposited to $32.17 — smoke test positions resolved profitably.
 
-`trader.py` was substantially refactored away from optimistic paper-style execution.
+### Two bugs fixed
 
-- `LiveTrader` no longer inherits `PaperTrader` as the source of truth for live fills.
-- Live state is now split into:
-  - desired positions
-  - open orders
-  - actual confirmed positions
-- Order/trade/position/settlement state is persisted in SQLite.
-- Live defaults now match the paper-tested strategy:
-  - `entry=0.38`
-  - `exit=0.70`
-  - `entry_delay=60`
-  - `max_entry_age=150`
-  - single-side by default
-  - BTC alignment required by default unless `--allow-contrarian`
-- Live auth now supports configurable wallet type and funder:
-  - `--signature-type`
-  - `--funder`
-  - default signature type is now `1` (`POLY_PROXY`) to match the user's Magic Link exported-key setup
-- Added paper-trader compatibility state back into `LiveTrader`:
-  - `_stopped_out`
-  - `_last_sell_time`
-  - this fixed a runtime crash in `Observer.run()`
+**Order DB collision (`UNIQUE constraint failed: live_orders.order_id`)**
+- Root cause: `LiveOrderState.order_id` defaulted to `""` and was written to DB before order submission. When a FAK order was killed by the exchange, `""` stayed in the DB. Every subsequent retry tried to insert another `""` and hit the UNIQUE constraint.
+- Fix: seed `order_id = client_order_id` before the first DB write in both `execute_buy` and `execute_sell`. Failed orders now carry a unique local ID; successful orders get updated to the real exchange `orderID`.
 
-### Exchange-truth reconciliation
-
-- Added live reconciliation loop for:
-  - open orders
-  - recent trades
-  - current positions
-- Added authenticated user WebSocket wiring and expanded market WebSocket event handling.
-- Added market-state persistence for resolution/settlement tracking.
-- End-of-window live handling now cancels orders and marks settlement pending instead of using the paper BTC proxy to “resolve” positions.
-
-### Execution / safety changes
-
-- Live orders now use immediate-execution semantics (`FAK`) instead of resting `GTC` for urgent entries/exits.
-- Order placement now refreshes market constraints:
-  - tick size
-  - min order size
-  - fee rate bps
-- Added slippage gates before order submission.
-- Added live safety controls:
-  - max total exposure
-  - max open orders
-  - max consecutive live errors / kill switch
-  - market-data health gating
-
-### Fee-aware accounting
-
-- Added explicit fee modeling for confirmed fills.
-- Added `live_fills` and `live_positions` tables.
-- Realized P&L and spendable bankroll now flow from confirmed fill/position state instead of optimistic order submission.
-- Fixed a real accounting bug discovered during testing:
-  - fills were being classified from market side (`up/down`) instead of execution action (`buy/sell`)
-  - this would have broken fee handling and inventory updates
-  - fixed in `trader.py`
-
-### Historical backfill support
-
-- Added `--backfill-history` support in `trader.py` using Polymarket price-history endpoints for token IDs.
+**Reconcile thread crash on shutdown (`sqlite3: Cannot operate on a closed database`)**
+- Root cause: `Observer.run()` called `db.close()`, then `LiveObserver`'s `finally` block called `stop_reconciliation()` — but the reconcile thread fired one more time on an already-closed connection.
+- Fix: added `_on_before_close()` hook to `Observer.run()` (called just before `db.close()`). `LiveObserver` overrides it to stop reconcile, heartbeat, and WebSocket threads in the correct order.
 
 ## Database status
 
-`observer.py` now manages additional live tables:
+`polymarket_smoke_test.db` — smoke test data, keep for reference.
+`polymarket_live.db` — use this for real strategy runs going forward.
 
-- `live_orders`
-- `live_fills`
-- `live_positions`
-- `live_reconciliation_state`
-- `live_market_state`
-
-These are in addition to the existing:
-
-- `markets`
-- `price_ticks`
-- `paper_trades`
-- `live_trades`
-- `strategy_config`
-
-`live_trades` is now mostly a compatibility/session summary table. The canonical live execution records are `live_orders`, `live_fills`, and `live_positions`.
-
-## Verification completed
-
-These local checks passed on 2026-04-11:
-
-```bash
-python3 -m py_compile observer.py trader.py test_live_trader.py
-python3 -m unittest test_live_trader.py
-```
-
-Current unit coverage includes:
-
-- tick-size rounding helpers
-- live order DB round-trip
-- live position DB round-trip
-- fee calculation
-- fee-aware fill application / realized P&L update
+Tables in both:
+- `live_orders`, `live_fills`, `live_positions`, `live_reconciliation_state`, `live_market_state`
+- `markets`, `price_ticks`, `paper_trades`, `live_trades`, `strategy_config`
 
 ## What is still not validated
 
-The live code is structurally much safer than before, but it is still not proven against the real exchange.
-
-Not yet validated end-to-end:
-
-- POLY_PROXY auth flow against the real account/funder combination
-- actual live order signing for the user's POLY_PROXY account
-- authenticated user WebSocket payload shape
-- market WebSocket payload shape beyond the documented fields
-- `get_trades()` response shape in practice
-- Data API positions response shape in practice
-- `cancel_market_orders()` parameter expectations
-- actual settlement / redemption reconciliation after market resolution
-- exact Polymarket fee behavior as observed on real fills vs the current local model
-
-This means the remaining risk is runtime integration mismatch, not obvious local logic bugs.
-
-Most recent live finding:
-
-- the bot now reaches authenticated order submission
-- a real buy attempt was made
-- Polymarket returned `400 invalid signature` on `POST /order`
-- this strongly suggests the remaining blocker is wallet/signer/funder configuration for the proxy account, not market-data or L2 credential setup
+- State reload on restart: `LiveTrader` persists `live_orders` / `live_positions` to DB on shutdown but reload behavior on startup hasn't been explicitly tested. If you stop mid-window, restart and watch whether the bot recognizes existing positions.
+- Settlement/redemption reconciliation after market resolution.
+- Authenticated user WebSocket payload shapes beyond what fired during the smoke test.
+- `cancel_market_orders()` behavior at scale.
+- Fee model accuracy vs actual exchange-reported fills at higher notional.
 
 ## Recommended next step
 
-Do not go straight to meaningful live size.
+Run the real strategy command above for a full session (several windows). Watch for:
+- Clean entry → exit cycles with expected reasons (`exit_target`)
+- Correct position count after each window close
+- Realized P&L matching what you see on Polymarket
+- No phantom open orders in the session summary
 
-Run a dry/smoke validation against the real account with tiny notional and verify:
-
-- order submission returns expected statuses
-- user WS trade/order events arrive and parse correctly
-- open orders in the exchange match `live_orders`
-- actual wallet positions match `live_positions`
-- fees and realized P&L in the DB match observed fills
-- end-of-window cancellation and settlement-pending handling behave correctly
-
-## Current working tree
-
-Uncommitted local changes exist in:
-
-- `observer.py`
-- `trader.py`
-- `test_live_trader.py`
+Once that looks good, bump `--max-position` and `--bankroll` to meaningful size.
