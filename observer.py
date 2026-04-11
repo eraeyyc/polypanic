@@ -1166,7 +1166,12 @@ class Observer:
             self._finalize_market(last_slug)
         self.db.flush_ticks()
         self._print_summary()
+        self._on_before_close()
         self.db.close()
+
+    def _on_before_close(self):
+        """Called just before db.close() — override in subclasses to stop background threads."""
+        pass
 
     def _finalize_market(self, slug: str):
         """Resolve any open positions when a window closes."""

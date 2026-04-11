@@ -1206,6 +1206,7 @@ class LiveTrader:
             client_order_id = uuid.uuid4().hex
             order_state = LiveOrderState(
                 client_order_id=client_order_id,
+                order_id=client_order_id,
                 slug=slug,
                 market_id=self._market(slug),
                 token_id=token_id,
@@ -1279,6 +1280,7 @@ class LiveTrader:
             client_order_id = uuid.uuid4().hex
             order_state = LiveOrderState(
                 client_order_id=client_order_id,
+                order_id=client_order_id,
                 slug=slug,
                 market_id=self._market(slug),
                 token_id=token_id,
@@ -1432,18 +1434,18 @@ class LiveObserver(Observer):
         else:
             logging.info(f"   ✅ Flat on {slug} after order cancellation/reconciliation")
 
+    def _on_before_close(self):
+        self.trader.stop_reconciliation()
+        self.trader.stop_heartbeat()
+        self.ws.stop()
+        self.user_ws.stop()
+        logging.info("Heartbeat and WebSocket stopped.")
+
     def run(self):
         self.trader.start_heartbeat()
         self.trader.start_reconciliation()
-        try:
-            self.trader.reconcile_exchange_state()
-            super().run()
-        finally:
-            self.trader.stop_reconciliation()
-            self.trader.stop_heartbeat()
-            self.ws.stop()
-            self.user_ws.stop()
-            logging.info("Heartbeat and WebSocket stopped.")
+        self.trader.reconcile_exchange_state()
+        super().run()
 
     def _print_summary(self):
         logging.info("\n" + "=" * 70)
