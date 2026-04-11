@@ -4,11 +4,13 @@ Watches every 5-minute Bitcoin up/down market on Polymarket, logs the full price
 
 ## The Strategy
 
-Polymarket's 5-minute BTC markets are driven by retail sentiment that overshoots in both directions — often independent of what BTC is actually doing. The play:
+The current edge is narrower than pure mean reversion. The database shows the losing trades are dominated by contrarian entries that decay into near-zero force exits. The play:
 
-1. **Buy** whichever side is cheap (ask ≤ entry threshold, and ≥ min entry floor)
-2. **Sell** when the market overreacts the other way (bid ≥ exit threshold)
-3. **Never hold through resolution** — force-exit before close unless BTC has moved strongly in your favor
+1. **Wait** for the first minute so the window has some directional information
+2. **Buy** the cheap side only if it agrees with BTC's move from the window open
+3. **Ignore** setups that appear too late in the 5-minute window
+4. **Sell** when the market overreacts the other way (bid ≥ exit threshold)
+5. **Never hold through resolution** — force-exit before close unless BTC has moved strongly in your favor
 
 ## Quick Start
 
@@ -17,7 +19,7 @@ Polymarket's 5-minute BTC markets are driven by retail sentiment that overshoots
 pip install requests py-clob-client websockets flask
 
 # Run paper trader (recommended settings)
-./run.sh observer.py --entry 0.40 --exit 0.65 --min-entry 0.15
+./run.sh observer.py --entry 0.38 --exit 0.70 --min-entry 0.15
 
 # Analyze collected data after running for a while
 ./run.sh observer.py --analyze
@@ -32,16 +34,18 @@ pip install requests py-clob-client websockets flask
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--entry` | 0.40 | Buy when best ask ≤ this price |
-| `--exit` | 0.65 | Sell when best bid ≥ this price |
+| `--entry` | 0.38 | Buy when best ask ≤ this price |
+| `--exit` | 0.70 | Sell when best bid ≥ this price |
 | `--min-entry` | 0.15 | Reject entries below this price — avoids buying near-dead markets |
 | `--stop-loss` | 0 | Sell if price drops to this (0 = disabled) |
 | `--stop-loss-after` | 60 | Only trigger stop-loss in the final N seconds of the window (0 = fire anytime) |
-| `--entry-delay` | 0 | Seconds to wait before first buy each window |
+| `--entry-delay` | 60 | Seconds to wait before first buy each window |
+| `--max-entry-age` | 150 | Stop opening new positions after this many seconds from window open (0 = disabled) |
 | `--btc-momentum` | 0 | Skip buying a side if BTC has moved $X against it from window open (0 = disabled) |
-| `--hold-threshold` | 0 | Skip force_exit near close if BTC has moved $X in your favor — let it resolve at $1.00 (0 = disabled) |
+| `--allow-contrarian` | false | Allow buying against BTC's move from the window open |
+| `--hold-threshold` | 15 | Skip force_exit near close if BTC has moved $X in your favor — let it resolve at $1.00 (0 = disabled) |
 | `--only-side` | — | Restrict entries to `up` or `down` only |
-| `--single-side` | false | Only allow one position per market window |
+| `--both-sides` | false | Allow positions in both UP and DOWN in the same market window |
 | `--bankroll` | 1000 | Starting paper bankroll |
 | `--poll` | 3.0 | Seconds between REST price polls (WebSocket takes over in live mode) |
 | `--db` | polymarket_observer.db | SQLite database path |
