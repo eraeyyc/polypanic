@@ -597,14 +597,26 @@ class LiveTrader:
     def reserved_notional(self) -> float:
         total = 0.0
         for order in self.open_orders.values():
-            if order.side == "buy" and order.status not in {"cancelled", "filled", "failed"}:
+            if order.intent == "buy" and order.status not in {"cancelled", "filled", "failed", "confirmed"}:
                 total += max(0.0, order.requested_notional)
         return total
 
     def total_live_exposure(self) -> float:
         return self.position_cost_basis() + self.reserved_notional()
 
+    @staticmethod
+    def _slug_window_end_ts(slug: str) -> float:
+        """Extract the 5-minute window end timestamp from a slug like btc-updown-5m-1775904600."""
+        try:
+            return float(slug.rsplit("-", 1)[-1]) + 300.0
+        except (ValueError, IndexError):
+            return 0.0
+
     def _load_state_from_db(self):
+        _terminal = {"cancelled", "failed", "filled", "confirmed"}
+        _non_terminal = lambda s: s not in _terminal
+        now = _now_ts()
+
         for row in self.db.get_live_orders():
             state = LiveOrderState(
                 client_order_id=row["client_order_id"],
@@ -624,10 +636,23 @@ class LiveTrader:
                 fee_rate_bps=row["fee_rate_bps"] or 0,
                 status=row["status"] or "unknown",
                 error_text=row["error_text"] or "",
-                created_at=row["created_at"] or _now_ts(),
-                updated_at=row["updated_at"] or _now_ts(),
+                created_at=row["created_at"] or now,
+                updated_at=row["updated_at"] or now,
                 raw_json=row["raw_json"] or "",
             )
+            # Expire stale non-terminal orders from windows that have already closed.
+            # These orders can never be filled and must not block future entries.
+            if _non_terminal(state.status):
+                window_end = self._slug_window_end_ts(state.slug)
+                if window_end > 0 and now > window_end + 60:
+                    logging.info(
+                        f"Startup: expiring stale {state.status} order {state.client_order_id} "
+                        f"for closed window {state.slug}"
+                    )
+                    state.status = "cancelled"
+                    state.error_text = "expired_on_restart"
+                    state.updated_at = now
+                    self.db.upsert_live_order(state.to_record())
             key = state.order_id or state.client_order_id
             self.open_orders[key] = state
 

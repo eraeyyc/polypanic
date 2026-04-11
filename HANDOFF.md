@@ -50,10 +50,14 @@ Scale `--max-position` and `--bankroll` up after a few clean cycles.
 
 2. **Reconcile thread using closed DB on shutdown** — `Observer.run()` closed the DB before `LiveObserver` stopped the reconcile thread. Fixed with `_on_before_close()` hook in `Observer`.
 
+3. **Stale orders blocking all entries after restart** — On restart, `_load_state_from_db` loaded orders with status `pending_submit` / `cancel_pending` from closed windows into `open_orders`. These counted against `max_open_live_orders=4`, so 5 stale orders from the first session silently blocked every `evaluate_entry` call in all 6 subsequent markets. Fixed: `_load_state_from_db` now detects non-terminal orders for windows that closed >60s ago and marks them `cancelled` (both in memory and DB) before they enter `open_orders`. Added `_slug_window_end_ts()` helper to extract the window timestamp from the slug.
+
+4. **`reserved_notional()` always returned 0** — Checked `order.side == "buy"` but `order.side` stores `"up"` / `"down"`. Changed to `order.intent == "buy"`. This was a silent bug that could have allowed over-exposure if many buy orders were open simultaneously; in practice it was masked by the open-orders count gate.
+
 ## What still needs watching
 
-- **State reload on restart** — `LiveTrader` persists positions/orders to DB but startup reload hasn't been explicitly tested mid-window. Watch behavior if the bot is stopped and restarted while holding a position.
-- **Phantom open orders** — session summary showed 5 open orders at shutdown (stale records from pre-fix failed attempts). These should clear up now that the UNIQUE constraint bug is fixed. Confirm open orders = 0 at clean shutdown.
+- **State reload mid-window** — stale order expiry uses a 60s grace period after window close, so if the bot is stopped and restarted within the same 5-minute window, reload behaves correctly (orders aren't yet expired). Watch behavior across a restart mid-position.
+- **Stale positions from closed windows** — `live_positions` with `settlement_status='open'` from resolved windows are loaded and eat into `bankroll` via `position_cost_basis()`. They don't block entries (slug-scoped checks), but they do reduce spendable capital until settlement reconciliation clears them. Priority: fix settlement reconciliation.
 - **Settlement reconciliation** — positions held through window close should get marked `settlement_pending`. Verify those reconcile correctly once the market resolves.
 - **User WebSocket payload shapes** — only lightly exercised. If event parsing breaks, the reconcile loop will catch it via REST fallback, but log noise will increase.
 
@@ -64,6 +68,7 @@ Scale `--max-position` and `--bankroll` up after a few clean cycles.
 - Do not switch back to both-sides or the old `0.40 / 0.65` config.
 - Do not remove the `_on_before_close()` shutdown ordering — it prevents the DB-closed crash.
 - Do not remove `order_id = client_order_id` seeding — it prevents the UNIQUE constraint cascade.
+- Do not remove `_slug_window_end_ts` stale-order expiry — it prevents phantom orders from blocking future entries.
 
 ## Files
 
