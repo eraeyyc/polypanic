@@ -10,6 +10,9 @@ env/
 .env
 .env.*
 *.env
+.envrc
+.direnv/
+.polymarket/
 keys.json
 *_keys.json
 *credentials*.json

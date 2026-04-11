@@ -134,6 +134,25 @@ class StrategyConfig:
     # Restrict entries to one side only: "up", "down", or "" for both
     only_side: str = ""
 
+    # Live trading: cap total notional tied up in confirmed inventory + open buy orders.
+    max_total_live_exposure: float = 100.0
+
+    # Live trading: maximum number of simultaneously open exchange orders.
+    max_open_live_orders: int = 4
+
+    # Live trading: kill-switch threshold for repeated exchange/reconciliation failures.
+    max_consecutive_live_errors: int = 5
+
+    # Live trading: how often to poll exchange truth for orders/trades.
+    reconcile_interval_secs: float = 2.0
+
+    # Live trading: how often to poll Data API positions for inventory sanity checks.
+    positions_poll_interval_secs: float = 10.0
+
+    # Live trading: maximum acceptable market-price slippage beyond the observed quote.
+    max_live_entry_slippage: float = 0.03
+    max_live_exit_slippage: float = 0.05
+
     def to_dict(self):
         return asdict(self)
 
@@ -381,6 +400,78 @@ class Database:
                 FOREIGN KEY (slug) REFERENCES markets(slug)
             );
 
+            CREATE TABLE IF NOT EXISTS live_orders (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_order_id    TEXT UNIQUE,
+                order_id           TEXT UNIQUE,
+                slug               TEXT,
+                market_id          TEXT,
+                token_id           TEXT,
+                side               TEXT,
+                intent             TEXT,
+                order_type         TEXT,
+                tif                TEXT,
+                requested_price    REAL,
+                requested_shares   REAL,
+                requested_notional REAL,
+                filled_shares      REAL DEFAULT 0,
+                avg_fill_price     REAL,
+                fee_rate_bps       INTEGER DEFAULT 0,
+                status             TEXT,
+                error_text         TEXT,
+                created_at         REAL,
+                updated_at         REAL,
+                raw_json           TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS live_fills (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id       TEXT UNIQUE,
+                order_id       TEXT,
+                slug           TEXT,
+                market_id      TEXT,
+                token_id       TEXT,
+                side           TEXT,
+                fill_price     REAL,
+                fill_shares    REAL,
+                gross_notional REAL,
+                fee_amount     REAL,
+                fee_asset      TEXT,
+                role           TEXT,
+                status         TEXT,
+                trade_ts       REAL,
+                raw_json       TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS live_positions (
+                slug              TEXT,
+                token_id          TEXT,
+                side              TEXT,
+                shares            REAL,
+                avg_cost          REAL,
+                realized_pnl      REAL DEFAULT 0,
+                total_fees        REAL DEFAULT 0,
+                settlement_status TEXT DEFAULT 'open',
+                updated_at        REAL,
+                PRIMARY KEY (slug, token_id, side)
+            );
+
+            CREATE TABLE IF NOT EXISTS live_reconciliation_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS live_market_state (
+                slug               TEXT PRIMARY KEY,
+                market_id          TEXT,
+                resolved           INTEGER DEFAULT 0,
+                resolution_outcome TEXT,
+                winning_token_id   TEXT,
+                settlement_status  TEXT DEFAULT 'open',
+                updated_at         REAL,
+                raw_json           TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS strategy_config (
                 id          INTEGER PRIMARY KEY CHECK (id = 1),
                 config_json TEXT
@@ -391,6 +482,9 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_ticks_slug_ts    ON price_ticks(slug, timestamp);
             CREATE INDEX IF NOT EXISTS idx_trades_slug      ON paper_trades(slug);
             CREATE INDEX IF NOT EXISTS idx_live_trades_slug ON live_trades(slug);
+            CREATE INDEX IF NOT EXISTS idx_live_orders_slug_status ON live_orders(slug, status);
+            CREATE INDEX IF NOT EXISTS idx_live_fills_order_id ON live_fills(order_id);
+            CREATE INDEX IF NOT EXISTS idx_live_positions_slug ON live_positions(slug);
         """)
         self.conn.commit()
 
@@ -515,6 +609,159 @@ class Database:
             (filled_price, order_id),
         )
         self.conn.commit()
+
+    def upsert_live_order(self, order: dict):
+        self.conn.execute("""
+            INSERT INTO live_orders
+            (client_order_id, order_id, slug, market_id, token_id, side, intent,
+             order_type, tif, requested_price, requested_shares, requested_notional,
+             filled_shares, avg_fill_price, fee_rate_bps, status, error_text,
+             created_at, updated_at, raw_json)
+            VALUES
+            (:client_order_id, :order_id, :slug, :market_id, :token_id, :side, :intent,
+             :order_type, :tif, :requested_price, :requested_shares, :requested_notional,
+             :filled_shares, :avg_fill_price, :fee_rate_bps, :status, :error_text,
+             :created_at, :updated_at, :raw_json)
+            ON CONFLICT(client_order_id) DO UPDATE SET
+                order_id=excluded.order_id,
+                slug=excluded.slug,
+                market_id=excluded.market_id,
+                token_id=excluded.token_id,
+                side=excluded.side,
+                intent=excluded.intent,
+                order_type=excluded.order_type,
+                tif=excluded.tif,
+                requested_price=excluded.requested_price,
+                requested_shares=excluded.requested_shares,
+                requested_notional=excluded.requested_notional,
+                filled_shares=excluded.filled_shares,
+                avg_fill_price=excluded.avg_fill_price,
+                fee_rate_bps=excluded.fee_rate_bps,
+                status=excluded.status,
+                error_text=excluded.error_text,
+                updated_at=excluded.updated_at,
+                raw_json=excluded.raw_json
+        """, order)
+        self.conn.commit()
+
+    def get_live_orders(self, statuses: Optional[list[str]] = None, slug: Optional[str] = None):
+        sql = "SELECT * FROM live_orders"
+        params = []
+        clauses = []
+        if statuses:
+            clauses.append("status IN ({})".format(",".join("?" for _ in statuses)))
+            params.extend(statuses)
+        if slug:
+            clauses.append("slug=?")
+            params.append(slug)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at"
+        return self.conn.execute(sql, params).fetchall()
+
+    def get_live_order(self, order_id: str):
+        return self.conn.execute(
+            "SELECT * FROM live_orders WHERE order_id=? OR client_order_id=? LIMIT 1",
+            (order_id, order_id),
+        ).fetchone()
+
+    def insert_live_fill(self, fill: dict) -> bool:
+        cur = self.conn.execute("""
+            INSERT OR IGNORE INTO live_fills
+            (trade_id, order_id, slug, market_id, token_id, side, fill_price,
+             fill_shares, gross_notional, fee_amount, fee_asset, role,
+             status, trade_ts, raw_json)
+            VALUES
+            (:trade_id, :order_id, :slug, :market_id, :token_id, :side, :fill_price,
+             :fill_shares, :gross_notional, :fee_amount, :fee_asset, :role,
+             :status, :trade_ts, :raw_json)
+        """, fill)
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_live_fills(self, order_id: Optional[str] = None):
+        if order_id:
+            return self.conn.execute(
+                "SELECT * FROM live_fills WHERE order_id=? ORDER BY trade_ts",
+                (order_id,),
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM live_fills ORDER BY trade_ts"
+        ).fetchall()
+
+    def upsert_live_position(self, pos: dict):
+        self.conn.execute("""
+            INSERT INTO live_positions
+            (slug, token_id, side, shares, avg_cost, realized_pnl, total_fees,
+             settlement_status, updated_at)
+            VALUES
+            (:slug, :token_id, :side, :shares, :avg_cost, :realized_pnl, :total_fees,
+             :settlement_status, :updated_at)
+            ON CONFLICT(slug, token_id, side) DO UPDATE SET
+                shares=excluded.shares,
+                avg_cost=excluded.avg_cost,
+                realized_pnl=excluded.realized_pnl,
+                total_fees=excluded.total_fees,
+                settlement_status=excluded.settlement_status,
+                updated_at=excluded.updated_at
+        """, pos)
+        self.conn.commit()
+
+    def delete_live_position(self, slug: str, token_id: str, side: str):
+        self.conn.execute(
+            "DELETE FROM live_positions WHERE slug=? AND token_id=? AND side=?",
+            (slug, token_id, side),
+        )
+        self.conn.commit()
+
+    def get_live_positions(self, slug: Optional[str] = None):
+        if slug:
+            return self.conn.execute(
+                "SELECT * FROM live_positions WHERE slug=? ORDER BY side",
+                (slug,),
+            ).fetchall()
+        return self.conn.execute(
+            "SELECT * FROM live_positions ORDER BY slug, side"
+        ).fetchall()
+
+    def set_reconciliation_value(self, key: str, value: str):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO live_reconciliation_state (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def get_reconciliation_value(self, key: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT value FROM live_reconciliation_state WHERE key=?",
+            (key,),
+        ).fetchone()
+        return row["value"] if row else None
+
+    def upsert_live_market_state(self, state: dict):
+        self.conn.execute("""
+            INSERT INTO live_market_state
+            (slug, market_id, resolved, resolution_outcome, winning_token_id,
+             settlement_status, updated_at, raw_json)
+            VALUES
+            (:slug, :market_id, :resolved, :resolution_outcome, :winning_token_id,
+             :settlement_status, :updated_at, :raw_json)
+            ON CONFLICT(slug) DO UPDATE SET
+                market_id=excluded.market_id,
+                resolved=excluded.resolved,
+                resolution_outcome=excluded.resolution_outcome,
+                winning_token_id=excluded.winning_token_id,
+                settlement_status=excluded.settlement_status,
+                updated_at=excluded.updated_at,
+                raw_json=excluded.raw_json
+        """, state)
+        self.conn.commit()
+
+    def get_live_market_state(self, slug: str):
+        return self.conn.execute(
+            "SELECT * FROM live_market_state WHERE slug=?",
+            (slug,),
+        ).fetchone()
 
     def close(self):
         self.conn.close()
@@ -1102,6 +1349,8 @@ def main():
     parser.add_argument("--exit",        type=float, default=0.70, help="Sell threshold (default 0.70)")
     parser.add_argument("--stop-loss",   type=float, default=0.0,  help="Stop-loss price (0=off)")
     parser.add_argument("--bankroll",    type=float, default=1000.0)
+    parser.add_argument("--max-position", type=float, default=50.0, help="Max USDC per side per market (default: 50)")
+    parser.add_argument("--min-position", type=float, default=5.0, help="Min USDC per trade — avoid dust orders (default: 5)")
     parser.add_argument("--poll",        type=float, default=3.0,  help="REST poll interval seconds")
     parser.add_argument("--single-side",    action="store_true",    help="Deprecated: single-side is now the default")
     parser.add_argument("--both-sides",     action="store_true",    help="Allow both UP and DOWN positions in the same market")
@@ -1143,6 +1392,8 @@ def main():
         exit_threshold=args.exit,
         stop_loss=args.stop_loss,
         starting_bankroll=args.bankroll,
+        max_position_size=args.max_position,
+        min_position_usdc=args.min_position,
         poll_interval_secs=args.poll,
         allow_both_sides=args.both_sides,
         entry_delay_secs=args.entry_delay,
