@@ -58,10 +58,10 @@ class StrategyConfig:
     """Strategy parameters — tune these after running --analyze."""
 
     # Entry: buy a side when its best ask is at or below this price
-    entry_threshold: float = 0.40
+    entry_threshold: float = 0.38
 
     # Exit: sell when best bid hits this price
-    exit_threshold: float = 0.65
+    exit_threshold: float = 0.70
 
     # Stop-loss: sell if price drops to this (0 = disabled, hold to resolution)
     stop_loss: float = 0.0
@@ -85,13 +85,23 @@ class StrategyConfig:
     poll_interval_secs: float = 3.0
 
     # Allow buying both UP and DOWN in the same window
-    allow_both_sides: bool = True
+    allow_both_sides: bool = False
 
     # Reject entry if bid/ask spread exceeds this (wide spreads hide fake edge)
     max_entry_spread: float = 0.06
 
     # Don't enter until this many seconds have elapsed since window open (0 = off)
-    entry_delay_secs: int = 0
+    entry_delay_secs: int = 60
+
+    # Stop entering once the setup is too late in the 5-minute window.
+    # The recorded dataset performs materially worse once entries happen
+    # deep into the contract lifecycle, where mean-reversion time is limited.
+    max_entry_age_secs: int = 150
+
+    # Only buy in the same direction as BTC's move from window open.
+    # This removes the worst-performing entries from the current dataset:
+    # buying UP while BTC is down, and buying DOWN while BTC is up.
+    require_btc_alignment: bool = True
 
     # Don't buy a side if BTC has moved more than this many dollars against it
     # e.g. 30.0 means: skip DOWN if BTC is up $30+ from open, skip UP if BTC is down $30+
@@ -567,6 +577,13 @@ class PaperTrader:
             return False
         if self.config.entry_delay_secs > 0 and elapsed_secs < self.config.entry_delay_secs:
             return False
+        if self.config.max_entry_age_secs > 0 and elapsed_secs > self.config.max_entry_age_secs:
+            return False
+        if self.config.require_btc_alignment:
+            if side == "up" and btc_delta < 0:
+                return False
+            if side == "down" and btc_delta > 0:
+                return False
         if self.config.btc_momentum_threshold > 0:
             if side == "down" and btc_delta > self.config.btc_momentum_threshold:
                 return False
@@ -733,6 +750,8 @@ class Observer:
         logging.info(f"   Stop:     "
                      + (f"${self.config.stop_loss:.2f}" if self.config.stop_loss else "disabled"))
         logging.info(f"   Sides:    {'both' if self.config.allow_both_sides else 'one'}")
+        logging.info(f"   Window:   +{self.config.entry_delay_secs}s to +{self.config.max_entry_age_secs}s")
+        logging.info(f"   BTC dir:  {'aligned only' if self.config.require_btc_alignment else 'contrarian allowed'}")
         logging.info(f"   Bankroll: ${self.trader.bankroll:.2f}")
         logging.info(f"   Poll:     {self.config.poll_interval_secs}s (REST fallback)")
         logging.info("=" * 70)
@@ -1079,14 +1098,17 @@ def main():
     )
     parser.add_argument("--analyze",     action="store_true", help="Analyze collected data")
     parser.add_argument("--db",          default="polymarket_observer.db")
-    parser.add_argument("--entry",       type=float, default=0.40, help="Buy threshold  (default 0.40)")
-    parser.add_argument("--exit",        type=float, default=0.65, help="Sell threshold (default 0.65)")
+    parser.add_argument("--entry",       type=float, default=0.38, help="Buy threshold  (default 0.38)")
+    parser.add_argument("--exit",        type=float, default=0.70, help="Sell threshold (default 0.70)")
     parser.add_argument("--stop-loss",   type=float, default=0.0,  help="Stop-loss price (0=off)")
     parser.add_argument("--bankroll",    type=float, default=1000.0)
     parser.add_argument("--poll",        type=float, default=3.0,  help="REST poll interval seconds")
-    parser.add_argument("--single-side",    action="store_true",    help="Only one position per market")
-    parser.add_argument("--entry-delay",    type=int,   default=0,  help="Seconds to wait before first buy (default 0)")
+    parser.add_argument("--single-side",    action="store_true",    help="Deprecated: single-side is now the default")
+    parser.add_argument("--both-sides",     action="store_true",    help="Allow both UP and DOWN positions in the same market")
+    parser.add_argument("--entry-delay",    type=int,   default=60,  help="Seconds to wait before first buy (default 60)")
+    parser.add_argument("--max-entry-age",  type=int,   default=150, help="Stop opening new positions after N seconds from window open (default 150, 0=off)")
     parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
+    parser.add_argument("--allow-contrarian", action="store_true", help="Allow entries against BTC's move from window open")
     parser.add_argument("--hold-threshold",    type=float, default=15.0, help="Hold through close if BTC moved $X in your favor (default 15.0, 0=off)")
     parser.add_argument("--cooldown",          type=int,   default=10,  help="Seconds to block re-entry after a sell (default 10, 0=off)")
     parser.add_argument("--stop-loss-after",   type=int,   default=60, help="Only trigger stop_loss in final N seconds of window (default 60, 0=anytime)")
@@ -1122,8 +1144,10 @@ def main():
         stop_loss=args.stop_loss,
         starting_bankroll=args.bankroll,
         poll_interval_secs=args.poll,
-        allow_both_sides=not args.single_side,
+        allow_both_sides=args.both_sides,
         entry_delay_secs=args.entry_delay,
+        max_entry_age_secs=args.max_entry_age,
+        require_btc_alignment=not args.allow_contrarian,
         btc_momentum_threshold=args.btc_momentum,
         hold_through_close_btc_threshold=args.hold_threshold,
         stop_loss_after_secs=args.stop_loss_after,
