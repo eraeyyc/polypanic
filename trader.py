@@ -802,6 +802,9 @@ class LiveTrader:
         self.open_orders.pop(order_state.client_order_id, None)
         self.open_orders.pop(key, None)
 
+    def _missing_position_grace_secs(self) -> float:
+        return max(15.0, self.config.positions_poll_interval_secs * 3)
+
     def _check_allowance(self, token_id: str, side: str, expected_shares: float, expected_notional: float) -> bool:
         try:
             if side == "buy":
@@ -1021,8 +1024,17 @@ class LiveTrader:
                     self.actual_positions.pop(key, None)
                     continue
                 if key not in seen:
-                    # Keep local reconciled state if Data API is temporarily behind.
-                    continue
+                    if self._open_order_for(pos.slug, pos.side):
+                        continue
+                    if _now_ts() - pos.updated_at < self._missing_position_grace_secs():
+                        # Give the Data API time to converge before clearing inventory.
+                        continue
+                    logging.warning(
+                        f"Clearing stale local position {pos.slug}:{pos.side} after "
+                        f"{self._missing_position_grace_secs():.0f}s absent from Data API"
+                    )
+                    self.db.delete_live_position(pos.slug, pos.token_id, pos.side)
+                    self.actual_positions.pop(key, None)
             self._clear_error()
         except Exception as exc:
             self._record_error(f"Position reconciliation failed: {exc}")

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from observer import Database
 from trader import (
@@ -37,6 +38,9 @@ class DummyClob:
         if self.fail_post_order:
             raise RuntimeError("boom")
         return {"orderID": "oid-live", "status": "submitted"}
+
+    def get_address(self):
+        return "0xdeadbeef"
 
 
 class TickRoundingTests(unittest.TestCase):
@@ -234,6 +238,28 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertEqual(orders[0]["status"], "failed")
         self.assertIn("boom", orders[0]["error_text"])
         self.assertEqual(trader.open_orders, {})
+        trader.db.close()
+
+    def test_missing_data_api_position_clears_stale_local_inventory(self):
+        trader = self._build_trader()
+        trader.register_market("btc-updown-5m-1", "token-up", "token-down", "market-1", "cond-1")
+        stale = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-up",
+            side="up",
+            shares=13.0,
+            avg_cost=0.35,
+            updated_at=10.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:up"] = stale
+        trader.db.upsert_live_position(stale.to_record())
+
+        with patch.object(trader.data_api, "get_positions", return_value=[]), \
+             patch("trader._now_ts", return_value=100.0):
+            trader._sync_positions_from_data_api()
+
+        self.assertNotIn("btc-updown-5m-1:up", trader.actual_positions)
+        self.assertEqual(trader.db.get_live_positions("btc-updown-5m-1"), [])
         trader.db.close()
 
 
