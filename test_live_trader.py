@@ -5,13 +5,38 @@ from trader import (
     LiveOrderState,
     LivePositionState,
     LiveTrader,
+    TERMINAL_ORDER_STATUSES,
     _round_down_to_tick,
     _round_up_to_tick,
 )
 
 
 class DummyClob:
-    pass
+    def __init__(self):
+        self.fail_post_order = False
+
+    def get_order_book(self, token_id):
+        class _Book:
+            tick_size = "0.01"
+            min_order_size = "1"
+        return _Book()
+
+    def get_fee_rate_bps(self, token_id):
+        return 72
+
+    def calculate_market_price(self, token_id, side, amount, order_type):
+        return 0.38
+
+    def get_balance_allowance(self, params):
+        return {"balance": "1000", "allowance": "1000"}
+
+    def create_market_order(self, args):
+        return {"signed": True, "args": args}
+
+    def post_order(self, signed, order_type):
+        if self.fail_post_order:
+            raise RuntimeError("boom")
+        return {"orderID": "oid-live", "status": "submitted"}
 
 
 class TickRoundingTests(unittest.TestCase):
@@ -151,6 +176,64 @@ class LiveAccountingTests(unittest.TestCase):
         self.assertAlmostEqual(pos.shares, 49.568)
         self.assertAlmostEqual(pos.realized_pnl, 35.0 - 0.1512 - (50.0 * (40.0 / 99.568)), places=6)
         self.assertAlmostEqual(pos.total_fees, 0.324, places=6)
+        trader.db.close()
+
+
+class LiveStateHandlingTests(unittest.TestCase):
+    def _build_trader(self):
+        from observer import StrategyConfig
+
+        return LiveTrader(StrategyConfig(), Database(":memory:"), DummyClob())
+
+    def test_closed_orders_are_terminal_for_capacity_and_side_checks(self):
+        trader = self._build_trader()
+        closed = LiveOrderState(
+            client_order_id="cid-closed",
+            order_id="oid-closed",
+            slug="btc-updown-5m-1",
+            market_id="cond-1",
+            token_id="token-1",
+            side="up",
+            intent="buy",
+            order_type="market",
+            tif="FAK",
+            requested_price=0.38,
+            requested_shares=10.0,
+            requested_notional=3.8,
+            fee_rate_bps=72,
+            created_at=1.0,
+            status="closed",
+        )
+        trader.open_orders[closed.order_id] = closed
+        self.assertIn("closed", TERMINAL_ORDER_STATUSES)
+        self.assertIsNone(trader._open_order_for("btc-updown-5m-1", "up"))
+        self.assertTrue(trader._ensure_buy_capacity(5.0))
+        trader.db.close()
+
+    def test_market_data_health_can_clear_transient_kill_switch(self):
+        trader = self._build_trader()
+        trader._consecutive_errors = 0
+        for _ in range(trader.config.max_consecutive_live_errors):
+            trader.set_market_data_health(False)
+        self.assertTrue(trader._kill_switch)
+        trader.set_market_data_health(True)
+        self.assertFalse(trader._kill_switch)
+        self.assertTrue(trader._market_data_ok)
+        trader.db.close()
+
+    def test_failed_buy_submission_is_marked_failed(self):
+        trader = self._build_trader()
+        trader.register_market("btc-updown-5m-1", "token-up", "token-down", "market-1", "cond-1")
+        trader._market_data_ok = True
+        trader.clob.fail_post_order = True
+
+        trader.execute_buy("btc-updown-5m-1", "up", 0.38, now=1.0, context={"test": True})
+
+        orders = trader.db.get_live_orders()
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0]["status"], "failed")
+        self.assertIn("boom", orders[0]["error_text"])
+        self.assertEqual(trader.open_orders, {})
         trader.db.close()
 
 

@@ -170,6 +170,15 @@ class LivePositionState:
         return record
 
 
+TERMINAL_ORDER_STATUSES = {
+    "cancelled",
+    "failed",
+    "filled",
+    "confirmed",
+    "closed",
+}
+
+
 class DataAPIClient:
     """Minimal Polymarket Data API client for current positions and price history."""
 
@@ -613,7 +622,7 @@ class LiveTrader:
             return 0.0
 
     def _load_state_from_db(self):
-        _terminal = {"cancelled", "failed", "filled", "confirmed"}
+        _terminal = TERMINAL_ORDER_STATUSES
         _non_terminal = lambda s: s not in _terminal
         now = _now_ts()
 
@@ -728,16 +737,18 @@ class LiveTrader:
 
     def _open_order_for(self, slug: str, side: str) -> Optional[LiveOrderState]:
         for order in self.open_orders.values():
-            if order.slug == slug and order.side == side and order.status not in {
-                "cancelled", "failed", "filled", "confirmed",
-            }:
+            if order.slug == slug and order.side == side and order.status not in TERMINAL_ORDER_STATUSES:
                 return order
         return None
 
     def set_market_data_health(self, ok: bool):
         if ok:
+            was_killed = self._kill_switch
             self._market_data_ok = True
             self._market_data_failures = 0
+            if was_killed and self._consecutive_errors < self.config.max_consecutive_live_errors:
+                self._kill_switch = False
+                logging.info("Live trader market-data kill switch cleared after healthy quotes resumed")
             return
         self._market_data_failures += 1
         self._market_data_ok = False
@@ -778,9 +789,18 @@ class LiveTrader:
     def _ensure_buy_capacity(self, notional: float) -> bool:
         if self._kill_switch or not self._market_data_ok:
             return False
-        if len([o for o in self.open_orders.values() if o.status not in {"cancelled", "failed", "filled", "confirmed"}]) >= self.config.max_open_live_orders:
+        if len([o for o in self.open_orders.values() if o.status not in TERMINAL_ORDER_STATUSES]) >= self.config.max_open_live_orders:
             return False
         return self.total_live_exposure() + notional <= self.config.max_total_live_exposure
+
+    def _mark_order_failed(self, order_state: LiveOrderState, exc: Exception):
+        order_state.status = "failed"
+        order_state.error_text = str(exc)
+        order_state.updated_at = _now_ts()
+        self.db.upsert_live_order(order_state.to_record())
+        key = order_state.order_id or order_state.client_order_id
+        self.open_orders.pop(order_state.client_order_id, None)
+        self.open_orders.pop(key, None)
 
     def _check_allowance(self, token_id: str, side: str, expected_shares: float, expected_notional: float) -> bool:
         try:
@@ -1206,6 +1226,7 @@ class LiveTrader:
             return
 
         try:
+            order_state = None
             est_price = self.clob.calculate_market_price(
                 token_id, BUY, size_usdc, OrderType.FAK
             )
@@ -1275,6 +1296,8 @@ class LiveTrader:
             self._handle_trade_like_event(resp if isinstance(resp, dict) else {})
             self._clear_error()
         except Exception as exc:
+            if order_state is not None:
+                self._mark_order_failed(order_state, exc)
             self._record_error(f"BUY order failed ({side} @ ${price:.4f}): {exc}")
 
     def execute_sell(self, slug: str, side: str, price: float, reason: str, now: float, context=None):
@@ -1287,6 +1310,7 @@ class LiveTrader:
             return
 
         try:
+            order_state = None
             est_price = self.clob.calculate_market_price(
                 token_id, SELL, pos.shares, OrderType.FAK
             )
@@ -1351,6 +1375,8 @@ class LiveTrader:
             self._handle_trade_like_event(resp if isinstance(resp, dict) else {})
             self._clear_error()
         except Exception as exc:
+            if order_state is not None:
+                self._mark_order_failed(order_state, exc)
             self._record_error(f"SELL order failed ({side} @ ${price:.4f}): {exc}")
 
     def cancel_market(self, slug: str):
