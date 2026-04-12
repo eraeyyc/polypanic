@@ -31,3 +31,6 @@ secrets/
 
 # macOS
 .DS_Store
+
+# Local repo instructions
+AGENTS.md
