@@ -926,6 +926,9 @@ class LiveTrader:
                 if not btc_confirms:
                     return "stop_loss"
         if seconds_remaining <= self.config.force_exit_before_close_secs:
+            neutral = self.config.hold_through_close_neutral_btc_range
+            if neutral > 0 and abs(btc_delta) <= neutral:
+                return None
             t = self.config.hold_through_close_btc_threshold
             if t > 0:
                 if side == "up" and btc_delta >= t:
@@ -1783,6 +1786,8 @@ Examples:
                         help="Allow entries against BTC move from window open")
     parser.add_argument("--hold-threshold", type=float, default=15.0,
                         help="Hold through close if BTC moved $X in your favor (default 15.0, 0=off)")
+    parser.add_argument("--hold-neutral-range", type=float, default=5.0,
+                        help="Hold through close if BTC is still within $X of the open near expiry (default 5.0, 0=off)")
     parser.add_argument("--cooldown",     type=int,   default=10,
                         help="Seconds to block re-entry after a sell (default 10, 0=off)")
     parser.add_argument("--max-position", type=float, default=50.0,
@@ -1899,6 +1904,7 @@ Examples:
         max_entry_age_secs       = args.max_entry_age,
         require_btc_alignment    = not args.allow_contrarian,
         hold_through_close_btc_threshold  = args.hold_threshold,
+        hold_through_close_neutral_btc_range = args.hold_neutral_range,
         post_sell_cooldown_secs  = args.cooldown,
         max_position_size        = args.max_position,
         max_total_live_exposure  = args.max_total_exposure,

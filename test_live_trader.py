@@ -302,6 +302,27 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertTrue(any("BTC misaligned for DOWN" in line for line in logs.output))
         trader.db.close()
 
+    def test_neutral_btc_range_holds_through_close(self):
+        trader = self._build_trader()
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="down",
+            shares=10.0,
+            avg_cost=0.35,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:down"] = pos
+        reason = trader.evaluate_exit(
+            "btc-updown-5m-1",
+            "down",
+            best_bid=0.12,
+            seconds_remaining=10.0,
+            btc_delta=-2.5,
+        )
+        self.assertIsNone(reason)
+        trader.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

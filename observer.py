@@ -113,6 +113,12 @@ class StrategyConfig:
     # 0 = disabled (always force_exit)
     hold_through_close_btc_threshold: float = 15.0
 
+    # Skip force_exit and let the market resolve if BTC is still within this
+    # many dollars of the window-open price near expiry. Small last-second BTC
+    # noise can flip the winner, so forcing out in a near-flat market often
+    # locks in a bad exit just before a favorable resolution.
+    hold_through_close_neutral_btc_range: float = 5.0
+
     # Only activate stop_loss when fewer than this many seconds remain in the window.
     # Prevents cutting a position that still has time to recover.
     # Default 60: stop_loss only fires in the last 60 seconds so positions have
@@ -881,6 +887,9 @@ class PaperTrader:
                 if not btc_confirms:
                     return "stop_loss"
         if seconds_remaining <= self.config.force_exit_before_close_secs:
+            neutral = self.config.hold_through_close_neutral_btc_range
+            if neutral > 0 and abs(btc_delta) <= neutral:
+                return None
             t = self.config.hold_through_close_btc_threshold
             if t > 0:
                 if side == "up"   and btc_delta >=  t:
@@ -1364,6 +1373,8 @@ def main():
     parser.add_argument("--btc-momentum",   type=float, default=0.0, help="Skip buy if BTC moved $X against the side (0=off)")
     parser.add_argument("--allow-contrarian", action="store_true", help="Allow entries against BTC's move from window open")
     parser.add_argument("--hold-threshold",    type=float, default=15.0, help="Hold through close if BTC moved $X in your favor (default 15.0, 0=off)")
+    parser.add_argument("--hold-neutral-range", type=float, default=5.0,
+                        help="Hold through close if BTC is still within $X of the open near expiry (default 5.0, 0=off)")
     parser.add_argument("--cooldown",          type=int,   default=10,  help="Seconds to block re-entry after a sell (default 10, 0=off)")
     parser.add_argument("--stop-loss-after",   type=int,   default=60, help="Only trigger stop_loss in final N seconds of window (default 60, 0=anytime)")
     parser.add_argument("--min-entry",         type=float, default=0.15, help="Reject entries below this price (default 0.15, 0=disabled)")
@@ -1406,6 +1417,7 @@ def main():
         require_btc_alignment=not args.allow_contrarian,
         btc_momentum_threshold=args.btc_momentum,
         hold_through_close_btc_threshold=args.hold_threshold,
+        hold_through_close_neutral_btc_range=args.hold_neutral_range,
         stop_loss_after_secs=args.stop_loss_after,
         min_entry_price=args.min_entry,
         post_sell_cooldown_secs=args.cooldown,
