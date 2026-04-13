@@ -262,6 +262,22 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertEqual(trader.db.get_live_positions("btc-updown-5m-1"), [])
         trader.db.close()
 
+    def test_entry_rejection_logs_reason(self):
+        trader = self._build_trader()
+        with self.assertLogs(level="INFO") as logs:
+            accepted = trader.evaluate_entry(
+                "btc-updown-5m-1",
+                "down",
+                best_ask=0.20,
+                best_bid=0.19,
+                seconds_remaining=120.0,
+                btc_delta=25.0,
+                elapsed_secs=90.0,
+            )
+        self.assertFalse(accepted)
+        self.assertTrue(any("BTC misaligned for DOWN" in line for line in logs.output))
+        trader.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

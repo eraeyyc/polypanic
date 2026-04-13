@@ -582,6 +582,7 @@ class LiveTrader:
         self._market_data_failures = 0
         self._consecutive_errors = 0
         self._kill_switch = False
+        self._last_entry_rejection_log: dict[str, tuple[str, float]] = {}
 
         self._hb_id: Optional[str] = None
         self._hb_stop = threading.Event()
@@ -805,6 +806,69 @@ class LiveTrader:
     def _missing_position_grace_secs(self) -> float:
         return max(15.0, self.config.positions_poll_interval_secs * 3)
 
+    def _log_entry_rejection(self, slug: str, side: str, reason: str):
+        key = self._key(slug, side)
+        now = _now_ts()
+        last_reason, last_ts = self._last_entry_rejection_log.get(key, ("", 0.0))
+        if reason != last_reason or now - last_ts >= 15.0:
+            logging.info(f"Skipping BUY {side.upper()} — {reason}")
+            self._last_entry_rejection_log[key] = (reason, now)
+
+    def _entry_rejection_reason(self, slug: str, side: str, best_ask: float,
+                                best_bid: float, seconds_remaining: float,
+                                btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> Optional[str]:
+        if self._kill_switch:
+            return "kill switch active"
+        if not self._market_data_ok:
+            return "market data unhealthy"
+        if side in self._stopped_out.get(slug, set()):
+            return "side stopped out this window"
+        if self.config.post_sell_cooldown_secs > 0:
+            last_sell = self._last_sell_time.get(slug, {}).get(side, 0.0)
+            remaining = self.config.post_sell_cooldown_secs - (time.time() - last_sell)
+            if remaining > 0:
+                return f"post-sell cooldown active ({remaining:.1f}s remaining)"
+        if self.config.only_side and side != self.config.only_side:
+            return f"restricted to only_side={self.config.only_side}"
+        if best_ask <= 0:
+            return "no valid ask"
+        if best_ask > self.config.entry_threshold:
+            return f"ask ${best_ask:.2f} above entry cap ${self.config.entry_threshold:.2f}"
+        if best_ask < self.config.min_entry_price:
+            return f"ask ${best_ask:.2f} below min entry ${self.config.min_entry_price:.2f}"
+        if best_ask - best_bid > self.config.max_entry_spread:
+            return (
+                f"spread ${(best_ask - best_bid):.2f} above max ${self.config.max_entry_spread:.2f}"
+            )
+        if seconds_remaining < self.config.min_time_remaining_secs:
+            return f"only {seconds_remaining:.1f}s remaining"
+        if self.config.entry_delay_secs > 0 and elapsed_secs < self.config.entry_delay_secs:
+            return f"entry delay active until +{self.config.entry_delay_secs}s"
+        if self.config.max_entry_age_secs > 0 and elapsed_secs > self.config.max_entry_age_secs:
+            return f"entry window expired after +{self.config.max_entry_age_secs}s"
+        if self.config.require_btc_alignment:
+            if side == "up" and btc_delta < 0:
+                return f"BTC misaligned for UP ({btc_delta:+.2f})"
+            if side == "down" and btc_delta > 0:
+                return f"BTC misaligned for DOWN ({btc_delta:+.2f})"
+        if self.config.btc_momentum_threshold > 0:
+            if side == "down" and btc_delta > self.config.btc_momentum_threshold:
+                return f"BTC momentum ${btc_delta:.2f} too positive for DOWN"
+            if side == "up" and btc_delta < -self.config.btc_momentum_threshold:
+                return f"BTC momentum ${btc_delta:.2f} too negative for UP"
+        if not self.config.allow_both_sides:
+            other = "down" if side == "up" else "up"
+            if self.has_position(slug, other) or self._open_order_for(slug, other):
+                return f"opposite side {other.upper()} already active"
+        if self.has_position(slug, side):
+            return "position already open"
+        if self._open_order_for(slug, side):
+            return "order already open for side"
+        capacity = min(self.config.max_position_size, self.bankroll)
+        if not self._ensure_buy_capacity(capacity):
+            return "buy-capacity gate blocked entry"
+        return None
+
     def _check_allowance(self, token_id: str, side: str, expected_shares: float, expected_notional: float) -> bool:
         try:
             if side == "buy":
@@ -839,45 +903,14 @@ class LiveTrader:
     def evaluate_entry(self, slug: str, side: str, best_ask: float,
                        best_bid: float, seconds_remaining: float,
                        btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> bool:
-        if self._kill_switch or not self._market_data_ok:
+        reason = self._entry_rejection_reason(
+            slug, side, best_ask, best_bid, seconds_remaining,
+            btc_delta=btc_delta, elapsed_secs=elapsed_secs,
+        )
+        if reason:
+            self._log_entry_rejection(slug, side, reason)
             return False
-        if side in self._stopped_out.get(slug, set()):
-            return False
-        if self.config.post_sell_cooldown_secs > 0:
-            last_sell = self._last_sell_time.get(slug, {}).get(side, 0.0)
-            if time.time() - last_sell < self.config.post_sell_cooldown_secs:
-                return False
-        if self.config.only_side and side != self.config.only_side:
-            return False
-        if best_ask <= 0 or best_ask > self.config.entry_threshold:
-            return False
-        if best_ask < self.config.min_entry_price:
-            return False
-        if best_ask - best_bid > self.config.max_entry_spread:
-            return False
-        if seconds_remaining < self.config.min_time_remaining_secs:
-            return False
-        if self.config.entry_delay_secs > 0 and elapsed_secs < self.config.entry_delay_secs:
-            return False
-        if self.config.max_entry_age_secs > 0 and elapsed_secs > self.config.max_entry_age_secs:
-            return False
-        if self.config.require_btc_alignment:
-            if side == "up" and btc_delta < 0:
-                return False
-            if side == "down" and btc_delta > 0:
-                return False
-        if self.config.btc_momentum_threshold > 0:
-            if side == "down" and btc_delta > self.config.btc_momentum_threshold:
-                return False
-            if side == "up" and btc_delta < -self.config.btc_momentum_threshold:
-                return False
-        if not self.config.allow_both_sides:
-            other = "down" if side == "up" else "up"
-            if self.has_position(slug, other) or self._open_order_for(slug, other):
-                return False
-        if self.has_position(slug, side) or self._open_order_for(slug, side):
-            return False
-        return self._ensure_buy_capacity(min(self.config.max_position_size, self.bankroll))
+        return True
 
     def evaluate_exit(self, slug: str, side: str, best_bid: float,
                       seconds_remaining: float, btc_delta: float = 0.0) -> Optional[str]:
