@@ -242,24 +242,48 @@ class LiveStateHandlingTests(unittest.TestCase):
 
     def test_missing_data_api_position_clears_stale_local_inventory(self):
         trader = self._build_trader()
-        trader.register_market("btc-updown-5m-1", "token-up", "token-down", "market-1", "cond-1")
+        slug = "btc-updown-5m-100"
+        trader.register_market(slug, "token-up", "token-down", "market-1", "cond-1")
         stale = LivePositionState(
-            slug="btc-updown-5m-1",
+            slug=slug,
             token_id="token-up",
             side="up",
             shares=13.0,
             avg_cost=0.35,
             updated_at=10.0,
         )
-        trader.actual_positions["btc-updown-5m-1:up"] = stale
+        trader.actual_positions[f"{slug}:up"] = stale
         trader.db.upsert_live_position(stale.to_record())
 
         with patch.object(trader.data_api, "get_positions", return_value=[]), \
-             patch("trader._now_ts", return_value=100.0):
+             patch("trader._now_ts", return_value=500.0):
             trader._sync_positions_from_data_api()
 
-        self.assertNotIn("btc-updown-5m-1:up", trader.actual_positions)
-        self.assertEqual(trader.db.get_live_positions("btc-updown-5m-1"), [])
+        self.assertNotIn(f"{slug}:up", trader.actual_positions)
+        self.assertEqual(trader.db.get_live_positions(slug), [])
+        trader.db.close()
+
+    def test_missing_data_api_position_does_not_clear_active_window_inventory(self):
+        trader = self._build_trader()
+        slug = "btc-updown-5m-100"
+        trader.register_market(slug, "token-up", "token-down", "market-1", "cond-1")
+        stale = LivePositionState(
+            slug=slug,
+            token_id="token-up",
+            side="up",
+            shares=13.0,
+            avg_cost=0.35,
+            updated_at=10.0,
+        )
+        trader.actual_positions[f"{slug}:up"] = stale
+        trader.db.upsert_live_position(stale.to_record())
+
+        with patch.object(trader.data_api, "get_positions", return_value=[]), \
+             patch("trader._now_ts", return_value=250.0):
+            trader._sync_positions_from_data_api()
+
+        self.assertIn(f"{slug}:up", trader.actual_positions)
+        self.assertEqual(len(trader.db.get_live_positions(slug)), 1)
         trader.db.close()
 
     def test_entry_rejection_logs_reason(self):

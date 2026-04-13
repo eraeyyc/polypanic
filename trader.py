@@ -1059,6 +1059,11 @@ class LiveTrader:
                 if key not in seen:
                     if self._open_order_for(pos.slug, pos.side):
                         continue
+                    window_end = self._slug_window_end_ts(pos.slug)
+                    if window_end <= 0 or _now_ts() < window_end:
+                        # Never clear inventory during an active market window based
+                        # solely on temporary Data API absence.
+                        continue
                     if _now_ts() - pos.updated_at < self._missing_position_grace_secs():
                         # Give the Data API time to converge before clearing inventory.
                         continue
