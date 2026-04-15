@@ -1615,7 +1615,42 @@ class LiveObserver(Observer):
         self.trader.start_heartbeat()
         self.trader.start_reconciliation()
         self.trader.reconcile_exchange_state()
+        self._settle_stale_positions()
         super().run()
+
+    def _settle_stale_positions(self):
+        """
+        On startup, finalize any positions from windows that closed before this
+        session started and were not yet settled.
+
+        This covers the cross-boundary restart case: stopped at T+280s of window A,
+        window B has since opened, window A positions are in the DB but
+        _finalize_market(A) was never called.
+
+        _load_state_from_db already handles the case where live_market_state has
+        a resolved=1 row (settlement applied there). This handles the remaining
+        case: window has expired by time but no market_resolved event was recorded,
+        so we mark them pending_reconciliation and let the reconcile loop catch up.
+        """
+        now = _now_ts()
+        pending_slugs: set[str] = set()
+        for pos in list(self.trader.actual_positions.values()):
+            if pos.shares <= 0 or pos.settlement_status == "settled":
+                continue
+            window_end = self.trader._slug_window_end_ts(pos.slug)
+            if window_end > 0 and now > window_end + 60:
+                pending_slugs.add(pos.slug)
+
+        for slug in pending_slugs:
+            mkt = self.db.get_live_market_state(slug)
+            if mkt and mkt["resolved"] and mkt["winning_token_id"]:
+                # Already handled by _load_state_from_db — skip.
+                continue
+            logging.warning(
+                f"Startup: found unsettled position for expired window {slug}. "
+                f"Marking pending_reconciliation — reconcile loop will resolve."
+            )
+            self.trader.mark_settlement_pending(slug)
 
     def _print_summary(self):
         logging.info("\n" + "=" * 70)
