@@ -57,14 +57,16 @@ Current live implementation includes:
 - live position tracking
 - fee-aware accounting
 - market-constraint checks
+- settlement P&L at $1/$0 per share on market resolution
+- restart state recovery (mid-window and cross-boundary)
 - live safety gates
 - historical token price backfill
 
-Important:
+Notes:
 
-- live trading is no longer based on optimistic paper fills
-- live settlement no longer uses the paper BTC proxy logic
-- this code still needs real exchange validation before it should be trusted with meaningful size
+- live trading is not based on optimistic paper fills
+- settlement uses the actual `winning_asset_id` from the WebSocket, not the paper BTC proxy logic
+- smoke test confirmed: fills, fee tracking, and realized P&L working correctly
 
 ### `test_live_trader.py`
 
@@ -197,21 +199,17 @@ Or with absolute timestamps:
 ./run.sh trader.py --backfill-history TOKEN_ID --history-start-ts 1775800000 --history-end-ts 1775880000
 ```
 
-## What still needs validation
+## What still needs runtime validation
 
-The local code passes compile/tests, but these live pieces still need runtime validation:
+The code is structurally complete. These pieces need real-exchange confirmation:
 
-- user WebSocket payload shape
-- market WebSocket payload shape
-- `get_trades()` response fields
-- Data API positions response fields
-- `cancel_market_orders()` behavior
-- settlement/redeem reconciliation after resolution
-- local fee model vs actual exchange fills
+- **User WebSocket payloads at higher fill volume** — basic trade/fill events confirmed in smoke test. Partial fills, maker events, unusual order states not yet seen live. Run with `--log-level DEBUG` and watch for `Unknown user event type=` log lines.
+- **Settlement P&L path** — `_settle_market()` is implemented but has never fired on a real resolved position. The first time a position holds to window close, verify `live_positions` is empty afterward and `realized_pnl` is correct.
+- **Fee model accuracy** — compare `live_fills.fee_amount` against actual exchange-reported fees at meaningful notional.
 
-The next serious step is a tiny-notional live smoke test and careful comparison of:
+Items from the previous list that are now resolved:
 
-- exchange open orders vs `live_orders`
-- actual wallet positions vs `live_positions`
-- actual fills vs `live_fills`
-- observed fees vs local P&L accounting
+- ~~settlement/redeem reconciliation after resolution~~ — implemented in `_settle_market()`
+- ~~`cancel_market_orders()` behavior~~ — guarded against empty-cancel errors and kill-switch bleed
+- ~~state reload on restart~~ — mid-window and cross-boundary cases both handled
+- ~~market WebSocket payload shape~~ — unknown event types logged at DEBUG

@@ -1,6 +1,6 @@
 # Status
 
-**Last updated:** 2026-04-11
+**Last updated:** 2026-04-15
 
 ## Current live setup
 
@@ -20,41 +20,40 @@ caffeinate -i python trader.py \
 
 Scale up `--max-position` and `--bankroll` once you've seen several clean cycles.
 
-## What changed in the 2026-04-11 (evening) session
+## What changed in the 2026-04-15 session
 
-### Live trading confirmed
+### Four structural gaps closed
 
-- Signature error (`400 invalid signature`) from earlier session is gone — auth flow is working.
-- Ran a smoke test with loose settings (`--entry 0.90 --exit 0.95 --allow-contrarian`) to force a trade.
-- Confirmed fills, fee tracking, and realized P&L all working correctly.
-- Polymarket balance went from $17 deposited to $32.17 — smoke test positions resolved profitably.
+**Settlement reconciliation (was the biggest gap)**
+- When a `market_resolved` WebSocket event arrives with a `winning_asset_id`, `_settle_market()` now computes final P&L: winning shares settle at $1.00/share, losing shares at $0.00. Positions are removed from active tracking and `realized_pnl` is persisted before deletion.
+- On startup, `_load_state_from_db` checks `live_market_state` for any loaded positions from already-resolved markets and settles them immediately.
+- If `winning_asset_id` is absent from the event (shouldn't happen), falls back to `pending_reconciliation` as before.
 
-### Two bugs fixed
+**Cross-boundary restart**
+- If the process stops near a window close and restarts after the next window has opened, positions from the expired window no longer silently accumulate. `_settle_stale_positions()` runs once at startup and marks them `pending_reconciliation` so the reconcile loop catches up via trade history.
+- Mid-window restart was already correct (main loop fires `_on_new_market` on first iteration).
 
-**Order DB collision (`UNIQUE constraint failed: live_orders.order_id`)**
-- Root cause: `LiveOrderState.order_id` defaulted to `""` and was written to DB before order submission. When a FAK order was killed by the exchange, `""` stayed in the DB. Every subsequent retry tried to insert another `""` and hit the UNIQUE constraint.
-- Fix: seed `order_id = client_order_id` before the first DB write in both `execute_buy` and `execute_sell`. Failed orders now carry a unique local ID; successful orders get updated to the real exchange `orderID`.
+**`cancel_market_orders()` kill-switch bleed**
+- `cancel_market()` no longer calls the exchange if there are no non-terminal open orders. Some APIs return errors on empty cancels, which previously would have incremented `_consecutive_errors` toward the kill switch.
+- Cancel failures are now routed to `logging.warning` instead of `_record_error` — a flaky cancel at window close can't trip the kill switch on the next window.
 
-**Reconcile thread crash on shutdown (`sqlite3: Cannot operate on a closed database`)**
-- Root cause: `Observer.run()` called `db.close()`, then `LiveObserver`'s `finally` block called `stop_reconciliation()` — but the reconcile thread fired one more time on an already-closed connection.
-- Fix: added `_on_before_close()` hook to `Observer.run()` (called just before `db.close()`). `LiveObserver` overrides it to stop reconcile, heartbeat, and WebSocket threads in the correct order.
+**WebSocket unknown event types**
+- Both `handle_market_event` and `handle_user_event` log any unrecognized `event_type` at DEBUG level. Silent at INFO (default), visible with `--log-level DEBUG`. Lets you catch unexpected payload shapes in production without adding noise.
 
 ## Database status
 
 `polymarket_smoke_test.db` — smoke test data, keep for reference.
 `polymarket_live.db` — use this for real strategy runs going forward.
 
-Tables in both:
+Tables:
 - `live_orders`, `live_fills`, `live_positions`, `live_reconciliation_state`, `live_market_state`
 - `markets`, `price_ticks`, `paper_trades`, `live_trades`, `strategy_config`
 
-## What is still not validated
+## What is still not validated at runtime
 
-- State reload on restart: `LiveTrader` persists `live_orders` / `live_positions` to DB on shutdown but reload behavior on startup hasn't been explicitly tested. If you stop mid-window, restart and watch whether the bot recognizes existing positions.
-- Settlement/redemption reconciliation after market resolution.
-- Authenticated user WebSocket payload shapes beyond what fired during the smoke test.
-- `cancel_market_orders()` behavior at scale.
-- Fee model accuracy vs actual exchange-reported fills at higher notional.
+- **User WebSocket payload shapes at higher volume** — the smoke test confirmed basic trade/fill events. Partial fills, maker events, and unusual order states haven't been seen live. Run with `--log-level DEBUG` and watch for `Unknown user event type=` lines.
+- **Fee model accuracy** — local fee computation vs actual exchange-reported fills at meaningful notional. Compare `live_fills.fee_amount` against what Polymarket shows.
+- **Settlement path end-to-end** — `_settle_market()` is implemented but has never fired on a real resolved position. The first time a position holds to window close, verify `realized_pnl` in `live_positions` matches the payout.
 
 ## Recommended next step
 
@@ -63,5 +62,6 @@ Run the real strategy command above for a full session (several windows). Watch 
 - Correct position count after each window close
 - Realized P&L matching what you see on Polymarket
 - No phantom open orders in the session summary
+- If anything holds to resolution: check `live_positions` is empty afterward and `realized_pnl` is correct
 
 Once that looks good, bump `--max-position` and `--bankroll` to meaningful size.
