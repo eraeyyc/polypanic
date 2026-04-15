@@ -46,6 +46,8 @@ export POLYMARKET_FUNDER=0x...
 - sell fills that leave only dust now clear the position and mark the order effectively filled
 - entry rejection reasons are logged
 - opposite-side flips are blocked for the configured sell cooldown window
+- sell-side fills are now tentative until confirmed by on-chain ERC1155 balance decrease
+- ghost/unconfirmed sell divergences are recorded and surfaced in summary output
 
 ### Shared paper/live behavior
 
@@ -57,6 +59,7 @@ export POLYMARKET_FUNDER=0x...
 ### Order-path latency
 
 - allowance/balance preflight is now briefly cached in live trading to reduce redundant REST calls during repeated attempts
+- direct Polygon `eth_call` balance reads are now used for sell confirmation and divergence checks
 
 ## Current evidence
 
@@ -70,6 +73,10 @@ export POLYMARKET_FUNDER=0x...
 ### Live trading
 
 Live trading works, but the dataset is still small. Several older DBs were contaminated by bugs that have since been fixed, so do not tune the strategy based on those alone.
+
+Important accounting caveat:
+- sell-side local accounting is now on-chain confirmed
+- buy-side accounting is still phase-1 / observability only, with divergence warnings rather than full tentative/confirmed balance enforcement
 
 ## What still needs validation
 

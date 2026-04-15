@@ -46,6 +46,19 @@ class DummyClob:
         return "0xdeadbeef"
 
 
+class DummyBalanceClient:
+    def __init__(self):
+        self.balances = {}
+        self.calls = 0
+        self.fail = False
+
+    def get_token_balance(self, address, token_id):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("rpc boom")
+        return self.balances.get(token_id, 0.0)
+
+
 class TickRoundingTests(unittest.TestCase):
     def test_round_up_to_tick(self):
         self.assertEqual(_round_up_to_tick(0.6831, 0.01), 0.69)
@@ -149,9 +162,9 @@ class LiveDatabaseTests(unittest.TestCase):
 
 class LiveAccountingTests(unittest.TestCase):
     def _build_trader(self):
-        from observer import StrategyConfig
-
-        return LiveTrader(StrategyConfig(), Database(":memory:"), DummyClob())
+        trader = LiveTrader(StrategyConfig(), Database(":memory:"), DummyClob())
+        trader.balance_api = DummyBalanceClient()
+        return trader
 
     def test_fee_calculation_for_buy_and_sell(self):
         trader = self._build_trader()
@@ -272,9 +285,9 @@ class LiveAccountingTests(unittest.TestCase):
 
 class LiveStateHandlingTests(unittest.TestCase):
     def _build_trader(self):
-        from observer import StrategyConfig
-
-        return LiveTrader(StrategyConfig(), Database(":memory:"), DummyClob())
+        trader = LiveTrader(StrategyConfig(), Database(":memory:"), DummyClob())
+        trader.balance_api = DummyBalanceClient()
+        return trader
 
     def test_closed_orders_are_terminal_for_capacity_and_side_checks(self):
         trader = self._build_trader()
@@ -501,7 +514,7 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertIsNone(reason)
         trader.db.close()
 
-    def test_trade_event_marks_order_filled_when_only_dust_remains(self):
+    def test_sell_trade_event_stays_tentative_until_onchain_balance_moves(self):
         trader = self._build_trader()
         order = LiveOrderState(
             client_order_id="cid-sell",
@@ -519,6 +532,9 @@ class LiveStateHandlingTests(unittest.TestCase):
             fee_rate_bps=72,
             created_at=1.0,
             status="submitted",
+            confirmation_status="tentative",
+            pre_balance_shares=8.2412,
+            last_observed_balance=8.2412,
         )
         trader.open_orders[order.order_id] = order
         trader.db.upsert_live_order(order.to_record())
@@ -543,8 +559,149 @@ class LiveStateHandlingTests(unittest.TestCase):
         })
 
         row = trader.db.get_live_order("oid-sell")
+        self.assertEqual(row["confirmation_status"], "tentative")
+        self.assertEqual(len(trader.db.get_live_positions("btc-updown-5m-1")), 1)
+        trader.db.close()
+
+    def test_tentative_sell_confirms_after_onchain_balance_decrease(self):
+        trader = self._build_trader()
+        order = LiveOrderState(
+            client_order_id="cid-sell",
+            order_id="oid-sell",
+            slug="btc-updown-5m-1",
+            market_id="cond-1",
+            token_id="token-1",
+            side="up",
+            intent="exit_target",
+            order_type="market",
+            tif="FAK",
+            requested_price=0.56,
+            requested_shares=8.2412,
+            requested_notional=4.6151,
+            fee_rate_bps=72,
+            created_at=1.0,
+            status="submitted",
+            confirmation_status="tentative",
+            pre_balance_shares=8.2412,
+            last_observed_balance=8.2412,
+            filled_shares=8.24,
+            avg_fill_price=0.56,
+        )
+        trader.open_orders[order.order_id] = order
+        trader.db.upsert_live_order(order.to_record())
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="up",
+            shares=8.2412,
+            avg_cost=0.364,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:up"] = pos
+        trader.db.upsert_live_position(pos.to_record())
+        trader.balance_api.balances["token-1"] = 0.001175152
+
+        with patch("trader._now_ts", return_value=5.0):
+            trader._confirm_tentative_sells()
+
+        row = trader.db.get_live_order("oid-sell")
+        self.assertEqual(row["confirmation_status"], "confirmed")
         self.assertEqual(row["status"], "filled")
         self.assertEqual(trader.db.get_live_positions("btc-updown-5m-1"), [])
+        trader.db.close()
+
+    def test_tentative_sell_without_balance_change_becomes_ghost_suspected(self):
+        trader = self._build_trader()
+        order = LiveOrderState(
+            client_order_id="cid-sell",
+            order_id="oid-sell",
+            slug="btc-updown-5m-1",
+            market_id="cond-1",
+            token_id="token-1",
+            side="up",
+            intent="exit_target",
+            order_type="market",
+            tif="FAK",
+            requested_price=0.56,
+            requested_shares=8.2412,
+            requested_notional=4.6151,
+            fee_rate_bps=72,
+            created_at=1.0,
+            status="submitted",
+            confirmation_status="tentative",
+            pre_balance_shares=8.2412,
+            last_observed_balance=8.2412,
+            filled_shares=8.24,
+            avg_fill_price=0.56,
+        )
+        trader.open_orders[order.order_id] = order
+        trader.db.upsert_live_order(order.to_record())
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="up",
+            shares=8.2412,
+            avg_cost=0.364,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:up"] = pos
+        trader.db.upsert_live_position(pos.to_record())
+        trader.balance_api.balances["token-1"] = 8.2412
+
+        with patch("trader._now_ts", return_value=10.0):
+            trader._confirm_tentative_sells()
+
+        row = trader.db.get_live_order("oid-sell")
+        self.assertEqual(row["confirmation_status"], "ghost_suspected")
+        self.assertEqual(len(trader.db.get_live_positions("btc-updown-5m-1")), 1)
+        self.assertEqual(len(trader.db.get_live_divergence_events()), 1)
+        trader.db.close()
+
+    def test_sell_confirmation_rpc_failure_fails_closed(self):
+        trader = self._build_trader()
+        order = LiveOrderState(
+            client_order_id="cid-sell",
+            order_id="oid-sell",
+            slug="btc-updown-5m-1",
+            market_id="cond-1",
+            token_id="token-1",
+            side="up",
+            intent="exit_target",
+            order_type="market",
+            tif="FAK",
+            requested_price=0.56,
+            requested_shares=8.2412,
+            requested_notional=4.6151,
+            fee_rate_bps=72,
+            created_at=1.0,
+            status="submitted",
+            confirmation_status="tentative",
+            pre_balance_shares=8.2412,
+            last_observed_balance=8.2412,
+            filled_shares=8.24,
+            avg_fill_price=0.56,
+        )
+        trader.open_orders[order.order_id] = order
+        trader.db.upsert_live_order(order.to_record())
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="up",
+            shares=8.2412,
+            avg_cost=0.364,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:up"] = pos
+        trader.db.upsert_live_position(pos.to_record())
+        trader.balance_api.fail = True
+
+        with patch("trader._now_ts", return_value=5.0):
+            trader._confirm_tentative_sells()
+
+        row = trader.db.get_live_order("oid-sell")
+        self.assertEqual(row["confirmation_status"], "tentative")
+        self.assertIn("sell_confirmation_failed", row["error_text"])
+        self.assertEqual(len(trader.db.get_live_positions("btc-updown-5m-1")), 1)
         trader.db.close()
 
 

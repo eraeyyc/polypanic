@@ -443,6 +443,11 @@ class Database:
                 avg_fill_price     REAL,
                 fee_rate_bps       INTEGER DEFAULT 0,
                 status             TEXT,
+                confirmation_status TEXT DEFAULT '',
+                confirmed_shares   REAL DEFAULT 0,
+                confirmed_at       REAL,
+                pre_balance_shares REAL DEFAULT 0,
+                last_observed_balance REAL DEFAULT 0,
                 error_text         TEXT,
                 created_at         REAL,
                 updated_at         REAL,
@@ -497,6 +502,16 @@ class Database:
                 raw_json           TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS live_divergence_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug          TEXT,
+                token_id      TEXT,
+                side          TEXT,
+                event_type    TEXT,
+                details_json  TEXT,
+                created_at    REAL
+            );
+
             CREATE TABLE IF NOT EXISTS strategy_config (
                 id          INTEGER PRIMARY KEY CHECK (id = 1),
                 config_json TEXT
@@ -523,6 +538,11 @@ class Database:
             "ALTER TABLE paper_trades ADD COLUMN seconds_remaining REAL",
             "ALTER TABLE paper_trades ADD COLUMN spread_at_trade REAL",
             "ALTER TABLE paper_trades ADD COLUMN signal_json TEXT",
+            "ALTER TABLE live_orders ADD COLUMN confirmation_status TEXT DEFAULT ''",
+            "ALTER TABLE live_orders ADD COLUMN confirmed_shares REAL DEFAULT 0",
+            "ALTER TABLE live_orders ADD COLUMN confirmed_at REAL",
+            "ALTER TABLE live_orders ADD COLUMN pre_balance_shares REAL DEFAULT 0",
+            "ALTER TABLE live_orders ADD COLUMN last_observed_balance REAL DEFAULT 0",
         ]:
             try:
                 self.conn.execute(sql)
@@ -640,12 +660,14 @@ class Database:
             INSERT INTO live_orders
             (client_order_id, order_id, slug, market_id, token_id, side, intent,
              order_type, tif, requested_price, requested_shares, requested_notional,
-             filled_shares, avg_fill_price, fee_rate_bps, status, error_text,
+             filled_shares, avg_fill_price, fee_rate_bps, status, confirmation_status,
+             confirmed_shares, confirmed_at, pre_balance_shares, last_observed_balance, error_text,
              created_at, updated_at, raw_json)
             VALUES
             (:client_order_id, :order_id, :slug, :market_id, :token_id, :side, :intent,
              :order_type, :tif, :requested_price, :requested_shares, :requested_notional,
-             :filled_shares, :avg_fill_price, :fee_rate_bps, :status, :error_text,
+             :filled_shares, :avg_fill_price, :fee_rate_bps, :status, :confirmation_status,
+             :confirmed_shares, :confirmed_at, :pre_balance_shares, :last_observed_balance, :error_text,
              :created_at, :updated_at, :raw_json)
             ON CONFLICT(client_order_id) DO UPDATE SET
                 order_id=excluded.order_id,
@@ -663,6 +685,11 @@ class Database:
                 avg_fill_price=excluded.avg_fill_price,
                 fee_rate_bps=excluded.fee_rate_bps,
                 status=excluded.status,
+                confirmation_status=excluded.confirmation_status,
+                confirmed_shares=excluded.confirmed_shares,
+                confirmed_at=excluded.confirmed_at,
+                pre_balance_shares=excluded.pre_balance_shares,
+                last_observed_balance=excluded.last_observed_balance,
                 error_text=excluded.error_text,
                 updated_at=excluded.updated_at,
                 raw_json=excluded.raw_json
@@ -747,6 +774,20 @@ class Database:
             ).fetchall()
         return self.conn.execute(
             "SELECT * FROM live_positions ORDER BY slug, side"
+        ).fetchall()
+
+    def insert_live_divergence_event(self, slug: str, token_id: str, side: str,
+                                     event_type: str, details: dict, created_at: float):
+        self.conn.execute("""
+            INSERT INTO live_divergence_events
+            (slug, token_id, side, event_type, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (slug, token_id, side, event_type, json.dumps(details), created_at))
+        self.conn.commit()
+
+    def get_live_divergence_events(self):
+        return self.conn.execute(
+            "SELECT * FROM live_divergence_events ORDER BY created_at"
         ).fetchall()
 
     def set_reconciliation_value(self, key: str, value: str):

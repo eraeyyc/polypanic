@@ -79,6 +79,10 @@ except ImportError:
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WS_USER_URL   = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 DATA_API      = "https://data-api.polymarket.com"
+POLYGON_RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+ERC1155_BALANCE_OF_SELECTOR = "0x00fdd58e"
+CTF_DECIMALS = 1_000_000
 
 
 def _now_ts() -> float:
@@ -140,6 +144,11 @@ class LiveOrderState:
     filled_shares: float = 0.0
     avg_fill_price: float = 0.0
     status: str = "pending_submit"
+    confirmation_status: str = ""
+    confirmed_shares: float = 0.0
+    confirmed_at: float = 0.0
+    pre_balance_shares: float = 0.0
+    last_observed_balance: float = 0.0
     error_text: str = ""
     updated_at: float = 0.0
     raw_json: str = ""
@@ -231,6 +240,41 @@ class DataAPIClient:
         except Exception as exc:
             logging.warning(f"Price history fetch failed for {token_id[:18]}...: {exc}")
             return []
+
+
+class PolygonBalanceClient:
+    """Minimal Polygon RPC client for ERC1155 balanceOf() reads."""
+
+    def __init__(self, rpc_url: str = POLYGON_RPC_URL):
+        self.rpc_url = rpc_url
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "PolymarketLiveTrader/1.0"})
+
+    @staticmethod
+    def _encode_balance_of_call(address: str, token_id: str) -> str:
+        addr = address.lower().replace("0x", "").rjust(64, "0")
+        tok = format(int(str(token_id), 10), "x").rjust(64, "0")
+        return f"{ERC1155_BALANCE_OF_SELECTOR}{addr}{tok}"
+
+    def get_token_balance(self, address: str, token_id: str) -> float:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{
+                "to": CTF_ADDRESS,
+                "data": self._encode_balance_of_call(address, token_id),
+            }, "latest"],
+        }
+        resp = self.session.post(self.rpc_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            raise RuntimeError(data["error"])
+        raw = data.get("result")
+        if not raw:
+            return 0.0
+        return int(raw, 16) / CTF_DECIMALS
 
 
 # ─── WebSocket Price Feed ─────────────────────────────────────────────────────
@@ -568,6 +612,7 @@ class LiveTrader:
         self.db = db
         self.clob = clob
         self.data_api = DataAPIClient()
+        self.balance_api = PolygonBalanceClient()
 
         self.desired_positions: dict[str, str] = {}  # slug:side -> reason
         self.open_orders: dict[str, LiveOrderState] = {}  # order_id/client_id -> state
@@ -584,6 +629,7 @@ class LiveTrader:
         self._kill_switch = False
         self._last_entry_rejection_log: dict[str, tuple[str, float]] = {}
         self._allowance_cache: dict[tuple[str, str], dict[str, float]] = {}
+        self._balance_cache: dict[str, dict[str, float]] = {}
 
         self._hb_id: Optional[str] = None
         self._hb_stop = threading.Event()
@@ -646,6 +692,11 @@ class LiveTrader:
                 avg_fill_price=row["avg_fill_price"] or 0.0,
                 fee_rate_bps=row["fee_rate_bps"] or 0,
                 status=row["status"] or "unknown",
+                confirmation_status=row["confirmation_status"] or "",
+                confirmed_shares=row["confirmed_shares"] or 0.0,
+                confirmed_at=row["confirmed_at"] or 0.0,
+                pre_balance_shares=row["pre_balance_shares"] or 0.0,
+                last_observed_balance=row["last_observed_balance"] or 0.0,
                 error_text=row["error_text"] or "",
                 created_at=row["created_at"] or now,
                 updated_at=row["updated_at"] or now,
@@ -861,6 +912,40 @@ class LiveTrader:
         cached["allowance"] = max(0.0, cached.get("allowance", 0.0) - required)
         cached["ts"] = _now_ts()
 
+    def _balance_cache_ttl(self) -> float:
+        return 2.0
+
+    def _get_onchain_balance(self, token_id: str, *, use_cache: bool = True) -> float:
+        now = _now_ts()
+        cached = self._balance_cache.get(token_id)
+        if use_cache and cached and now - cached.get("ts", 0.0) <= self._balance_cache_ttl():
+            return cached.get("shares", 0.0)
+        shares = self.balance_api.get_token_balance(self.clob.get_address(), token_id)
+        self._balance_cache[token_id] = {"ts": now, "shares": shares}
+        return shares
+
+    def _snapshot_slug_balances(self, slug: str, *, use_cache: bool = True) -> dict[str, float]:
+        balances = {}
+        for side in ("up", "down"):
+            token_id = self._token(slug, side)
+            if not token_id:
+                continue
+            balances[side] = self._get_onchain_balance(token_id, use_cache=use_cache)
+        return balances
+
+    def _divergence_tolerance(self, token_id: str) -> float:
+        constraint = self._constraint(token_id)
+        if constraint and constraint.min_order_size > 0:
+            return max(0.01, constraint.min_order_size * 0.01)
+        return 0.01
+
+    def _record_divergence(self, slug: str, token_id: str, side: str, event_type: str, details: dict):
+        logging.warning(f"{event_type} {slug}:{side} | {json.dumps(details, sort_keys=True)}")
+        self.db.insert_live_divergence_event(slug, token_id, side, event_type, details, _now_ts())
+
+    def _sell_confirmation_timeout_secs(self) -> float:
+        return max(6.0, self.config.reconcile_interval_secs * 3)
+
     def _entry_rejection_reason(self, slug: str, side: str, best_ask: float,
                                 best_bid: float, seconds_remaining: float,
                                 btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> Optional[str]:
@@ -970,6 +1055,126 @@ class LiveTrader:
             logging.warning(f"Allowance preflight failed ({side}): {exc}")
         return True
 
+    def _apply_confirmed_sell(self, order: LiveOrderState, confirmed_delta: float):
+        if confirmed_delta <= 1e-9:
+            return
+        fill_price = order.avg_fill_price or order.requested_price
+        fee_amount, fee_asset, _ = self._compute_fee(
+            confirmed_delta, fill_price, "sell", order.fee_rate_bps
+        )
+        self._apply_fill_to_positions(order, confirmed_delta, fill_price, fee_amount, fee_asset)
+
+    def _confirm_tentative_sells(self):
+        now = _now_ts()
+        for order in list(self.open_orders.values()):
+            if order.intent not in {"exit_target", "stop_loss", "force_exit"}:
+                continue
+            if order.confirmation_status not in {"tentative", "ghost_suspected"}:
+                continue
+            if not order.token_id or order.pre_balance_shares <= 0:
+                continue
+            try:
+                current_balance = self._get_onchain_balance(order.token_id, use_cache=False)
+            except Exception as exc:
+                order.error_text = f"sell_confirmation_failed: {exc}"
+                order.updated_at = now
+                self.db.upsert_live_order(order.to_record())
+                logging.warning(f"Sell confirmation failed for {order.slug}:{order.side}: {exc}")
+                continue
+
+            order.last_observed_balance = current_balance
+            observed_delta = max(0.0, order.pre_balance_shares - current_balance)
+            new_confirmed = min(order.requested_shares, observed_delta)
+            apply_delta = max(0.0, new_confirmed - order.confirmed_shares)
+            if apply_delta > 1e-9:
+                self._apply_confirmed_sell(order, apply_delta)
+                order.confirmed_shares = new_confirmed
+                order.confirmation_status = "confirmed"
+                order.confirmed_at = now
+                order.updated_at = now
+                self.db.upsert_live_order(order.to_record())
+
+            remaining_balance = current_balance
+            if self._shares_are_effectively_flat(order.token_id, remaining_balance):
+                remaining_balance = 0.0
+
+            remaining_confirm = max(0.0, order.requested_shares - order.confirmed_shares)
+            if remaining_balance <= 0 and remaining_confirm <= self._divergence_tolerance(order.token_id):
+                order.confirmation_status = "confirmed"
+                order.confirmed_shares = max(order.confirmed_shares, order.requested_shares)
+                order.confirmed_at = order.confirmed_at or now
+                order.status = "filled"
+                order.updated_at = now
+                self.db.upsert_live_order(order.to_record())
+                self.open_orders.pop(order.client_order_id, None)
+                if order.order_id:
+                    self.open_orders[order.order_id] = order
+                continue
+
+            if now - order.created_at >= self._sell_confirmation_timeout_secs():
+                if observed_delta <= self._divergence_tolerance(order.token_id):
+                    order.confirmation_status = "ghost_suspected"
+                    order.error_text = "ghost_fill_suspected"
+                    self._record_divergence(
+                        order.slug,
+                        order.token_id,
+                        order.side,
+                        "ghost_fill_suspected",
+                        {
+                            "order_id": order.order_id,
+                            "requested_shares": round(order.requested_shares, 6),
+                            "filled_shares": round(order.filled_shares, 6),
+                            "pre_balance": round(order.pre_balance_shares, 6),
+                            "current_balance": round(current_balance, 6),
+                        },
+                    )
+                else:
+                    order.confirmation_status = "expired"
+                    self._record_divergence(
+                        order.slug,
+                        order.token_id,
+                        order.side,
+                        "sell_confirmation_partial",
+                        {
+                            "order_id": order.order_id,
+                            "requested_shares": round(order.requested_shares, 6),
+                            "filled_shares": round(order.filled_shares, 6),
+                            "confirmed_shares": round(order.confirmed_shares, 6),
+                            "pre_balance": round(order.pre_balance_shares, 6),
+                            "current_balance": round(current_balance, 6),
+                        },
+                    )
+                order.updated_at = now
+                self.db.upsert_live_order(order.to_record())
+
+    def _check_balance_divergence(self):
+        for slug, meta in self._tokens.items():
+            for side in ("up", "down"):
+                token_id = meta.get(side)
+                if not token_id:
+                    continue
+                try:
+                    onchain = self._get_onchain_balance(token_id, use_cache=False)
+                except Exception as exc:
+                    logging.warning(f"On-chain balance check failed for {slug}:{side}: {exc}")
+                    continue
+                key = self._key(slug, side)
+                pos = self.actual_positions.get(key)
+                tol = self._divergence_tolerance(token_id)
+                local = pos.shares if pos else 0.0
+                if abs(local - onchain) > tol:
+                    self._record_divergence(
+                        slug,
+                        token_id,
+                        side,
+                        "local_onchain_mismatch",
+                        {
+                            "local_shares": round(local, 6),
+                            "onchain_shares": round(onchain, 6),
+                        },
+                    )
+
+
     def evaluate_entry(self, slug: str, side: str, best_ask: float,
                        best_bid: float, seconds_remaining: float,
                        btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> bool:
@@ -1051,9 +1256,11 @@ class LiveTrader:
         checkpoint = self.db.get_reconciliation_value("last_trade_after")
         after = int(float(checkpoint)) if checkpoint else None
         self._sync_recent_trades(after=after)
+        self._confirm_tentative_sells()
         now = _now_ts()
         if now - self._last_positions_sync >= self.config.positions_poll_interval_secs:
             self._sync_positions_from_data_api()
+            self._check_balance_divergence()
             self._last_positions_sync = now
 
     def _sync_open_orders(self):
@@ -1113,6 +1320,22 @@ class LiveTrader:
                 key = self._key(slug, side)
                 seen.add(key)
                 prev = self.actual_positions.get(key)
+                api_shares = _safe_float(row.get("size") or row.get("shares"))
+                try:
+                    onchain_shares = self._get_onchain_balance(asset_id, use_cache=False)
+                    if abs(api_shares - onchain_shares) > self._divergence_tolerance(asset_id):
+                        self._record_divergence(
+                            slug,
+                            asset_id,
+                            side,
+                            "data_api_onchain_mismatch",
+                            {
+                                "data_api_shares": round(api_shares, 6),
+                                "onchain_shares": round(onchain_shares, 6),
+                            },
+                        )
+                except Exception as exc:
+                    logging.warning(f"On-chain balance check failed during sync for {slug}:{side}: {exc}")
                 window_end = self._slug_window_end_ts(slug)
                 if prev and prev.shares > 0 and window_end > 0 and now < window_end:
                     # During an active market, trust local fills over the lagging Data API.
@@ -1122,7 +1345,7 @@ class LiveTrader:
                     slug=slug,
                     token_id=asset_id,
                     side=side,
-                    shares=_safe_float(row.get("size") or row.get("shares")),
+                    shares=api_shares,
                     avg_cost=_safe_float(row.get("avgPrice") or row.get("avg_cost")),
                     realized_pnl=(prev.realized_pnl if prev else 0.0),
                     total_fees=(prev.total_fees if prev else 0.0),
@@ -1254,6 +1477,11 @@ class LiveTrader:
                             avg_fill_price=row["avg_fill_price"] or 0.0,
                             fee_rate_bps=row["fee_rate_bps"] or 0,
                             status=row["status"] or "unknown",
+                            confirmation_status=row["confirmation_status"] or "",
+                            confirmed_shares=row["confirmed_shares"] or 0.0,
+                            confirmed_at=row["confirmed_at"] or 0.0,
+                            pre_balance_shares=row["pre_balance_shares"] or 0.0,
+                            last_observed_balance=row["last_observed_balance"] or 0.0,
                             error_text=row["error_text"] or "",
                             created_at=row["created_at"] or _now_ts(),
                             updated_at=row["updated_at"] or _now_ts(),
@@ -1297,13 +1525,21 @@ class LiveTrader:
                     order.updated_at = _now_ts()
                     order.raw_json = json.dumps(event)
                     self.db.upsert_live_order(order.to_record())
-                    self._apply_fill_to_positions(order, matched, price, fee_amount, fee_asset)
+                    if order.intent == "buy":
+                        self._apply_fill_to_positions(order, matched, price, fee_amount, fee_asset)
+                    else:
+                        order.confirmation_status = order.confirmation_status or "tentative"
+                        order.last_observed_balance = order.last_observed_balance or order.pre_balance_shares
+                        self.db.upsert_live_order(order.to_record())
                     self.db.insert_live_trade(
                         order.slug, _parse_ts(event.get("timestamp")), order.side, order.intent,
                         order_id, order.requested_price, price, matched * price, order.intent
                     )
                     remaining = max(0.0, order.requested_shares - order.filled_shares)
-                    if order.filled_shares + 1e-9 >= order.requested_shares or self._shares_are_effectively_flat(order.token_id, remaining):
+                    if order.intent == "buy" and (
+                        order.filled_shares + 1e-9 >= order.requested_shares
+                        or self._shares_are_effectively_flat(order.token_id, remaining)
+                    ):
                         order.status = "filled"
                         self.db.upsert_live_order(order.to_record())
         elif event.get("event_type") == "order" or event.get("size_matched") is not None:
@@ -1459,6 +1695,8 @@ class LiveTrader:
                 created_at=now,
                 updated_at=now,
                 status="pending_submit",
+                confirmation_status="confirmed",
+                confirmed_at=now,
                 raw_json=json.dumps(context or {}),
             )
             self.db.upsert_live_order(order_state.to_record())
@@ -1506,8 +1744,29 @@ class LiveTrader:
 
         try:
             order_state = None
+            onchain_shares = self._get_onchain_balance(token_id, use_cache=False)
+            sell_shares = min(pos.shares, onchain_shares)
+            tol = self._divergence_tolerance(token_id)
+            if pos.shares - onchain_shares > tol:
+                self._record_divergence(
+                    slug,
+                    token_id,
+                    side,
+                    "sellable_balance_mismatch",
+                    {
+                        "local_shares": round(pos.shares, 6),
+                        "onchain_shares": round(onchain_shares, 6),
+                    },
+                )
+            if self._shares_are_effectively_flat(token_id, sell_shares):
+                pos.shares = 0.0
+                pos.updated_at = now
+                self.db.delete_live_position(pos.slug, pos.token_id, pos.side)
+                self.actual_positions.pop(self._key(slug, side), None)
+                return
+
             est_price = self.clob.calculate_market_price(
-                token_id, SELL, pos.shares, OrderType.FAK
+                token_id, SELL, sell_shares, OrderType.FAK
             )
             min_acceptable = max(
                 0.01,
@@ -1519,7 +1778,7 @@ class LiveTrader:
                 )
                 return
             est_price = _round_down_to_tick(max(est_price, min_acceptable), constraint.tick_size)
-            if not self._check_allowance(token_id, "sell", pos.shares, pos.shares * est_price):
+            if not self._check_allowance(token_id, "sell", sell_shares, sell_shares * est_price):
                 return
             client_order_id = uuid.uuid4().hex
             order_state = LiveOrderState(
@@ -1533,12 +1792,15 @@ class LiveTrader:
                 order_type="market",
                 tif=OrderType.FAK,
                 requested_price=est_price,
-                requested_shares=round(pos.shares, 4),
-                requested_notional=round(pos.shares * est_price, 4),
+                requested_shares=round(sell_shares, 4),
+                requested_notional=round(sell_shares * est_price, 4),
                 fee_rate_bps=constraint.fee_rate_bps,
                 created_at=now,
                 updated_at=now,
                 status="pending_submit",
+                confirmation_status="tentative",
+                pre_balance_shares=onchain_shares,
+                last_observed_balance=onchain_shares,
                 raw_json=json.dumps(context or {}),
             )
             self.db.upsert_live_order(order_state.to_record())
@@ -1546,14 +1808,14 @@ class LiveTrader:
             signed = self.clob.create_market_order(
                 MarketOrderArgs(
                     token_id=token_id,
-                    amount=round(pos.shares, 4),
+                    amount=round(sell_shares, 4),
                     side=SELL,
                     price=est_price,
                     order_type=OrderType.FAK,
                 )
             )
             resp = self.clob.post_order(signed, OrderType.FAK)
-            self._consume_allowance_cache(token_id, "sell", pos.shares, pos.shares * est_price)
+            self._consume_allowance_cache(token_id, "sell", sell_shares, sell_shares * est_price)
             order_state.order_id = resp.get("orderID", "")
             order_state.status = (resp.get("status") or "submitted").lower()
             order_state.updated_at = _now_ts()
@@ -1566,9 +1828,10 @@ class LiveTrader:
             self._last_sell_time.setdefault(slug, {})[side] = now
             logging.info(
                 f"🔴 LIVE SELL {side.upper()} req=${est_price:.4f} | "
-                f"{pos.shares:.4f} shares | reason={reason} | id={(order_state.order_id or client_order_id)[:16]}..."
+                f"{sell_shares:.4f} shares | reason={reason} | id={(order_state.order_id or client_order_id)[:16]}..."
             )
             self._handle_trade_like_event(resp if isinstance(resp, dict) else {})
+            self._confirm_tentative_sells()
             self._clear_error()
         except Exception as exc:
             if order_state is not None:
@@ -1748,7 +2011,7 @@ class LiveObserver(Observer):
         if fills:
             gross = sum((f["gross_notional"] or 0.0) for f in fills)
             fees = sum((f["fee_amount"] or 0.0) for f in fills)
-            logging.info(f"   Confirmed fills: {len(fills)}")
+            logging.info(f"   Recorded fills:  {len(fills)}")
             logging.info(f"   Gross notional:  ${gross:.2f}")
             logging.info(f"   Fees:            ${fees:.2f}")
         open_orders = [
@@ -1756,6 +2019,13 @@ class LiveObserver(Observer):
             if (o["status"] or "") not in {"filled", "confirmed", "cancelled", "failed", "closed"}
         ]
         logging.info(f"   Open orders:     {len(open_orders)}")
+        tentative_sells = [
+            o for o in self.db.get_live_orders()
+            if (o["intent"] or "") in {"exit_target", "stop_loss", "force_exit"}
+            and (o["confirmation_status"] or "") in {"tentative", "ghost_suspected", "expired"}
+        ]
+        if tentative_sells:
+            logging.info(f"   Unconfirmed sells: {len(tentative_sells)}")
         live_positions = [p for p in self.trader.actual_positions.values() if p.shares > 0]
         logging.info(f"   Live positions:  {len(live_positions)}")
         logging.info(f"   Realized P&L:    ${self.trader.realized_pnl():+.2f}")

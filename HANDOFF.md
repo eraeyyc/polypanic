@@ -77,6 +77,8 @@ Do not overfit yet. The live sample is still too small and too noisy from prior 
 7. Near-close neutral BTC behavior was changed so the bot can hold through resolution when BTC is still within a small neutral range instead of forcing out at a terrible last-second price.
 8. Successful sell fills that leave only sub-minimum dust are now treated as flat positions, and the corresponding orders are marked effectively filled.
 9. Data API position sync no longer resurrects stale position size during an active window after a real sell.
+10. Sell-side ghost-fill hardening is now in place: sell fills are tentative until confirmed by on-chain ERC1155 balance decrease.
+11. Buy-side accounting is still phase-2 work; buys remain off-chain-accounted for now, but divergence checks now compare local/Data API/on-chain balances.
 
 ### Paper/live strategy alignment fixes
 
@@ -95,6 +97,7 @@ Do not overfit yet. The live sample is still too small and too noisy from prior 
 - Force-exit remains the biggest P&L drag in paper results.
 - Regular business-hour liquidity likely matters a lot; most early live tests were at bad overnight hours.
 - The strategy is still being tuned empirically. Do not assume the current `0.54` exit is final.
+- Local realized P&L is now more trustworthy on sells than buys, because only sells are balance-confirmed in phase 1.
 
 ### Live execution / infra
 
@@ -102,6 +105,7 @@ Do not overfit yet. The live sample is still too small and too noisy from prior 
 - Partial-fill and unusual order-state paths need more live exposure.
 - Settlement-through-resolution needs more real-world validation.
 - Exchange/API latency still dominates local logic time; if the bot feels slow, look at network-bound preflight and reconciliation work first, not `if` statements.
+- Buy-side ghost-fill hardening is still not implemented; current protection is sell-side confirmation plus divergence logging.
 
 ## Things not to regress
 
