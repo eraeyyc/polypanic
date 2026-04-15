@@ -837,6 +837,10 @@ class PaperTrader:
             last_sell = self._last_sell_time.get(slug, {}).get(side, 0.0)
             if time.time() - last_sell < self.config.post_sell_cooldown_secs:
                 return False
+            other = "down" if side == "up" else "up"
+            other_sell = self._last_sell_time.get(slug, {}).get(other, 0.0)
+            if time.time() - other_sell < self.config.post_sell_cooldown_secs:
+                return False
         if self.config.only_side and side != self.config.only_side:
             return False
         if best_ask <= 0 or best_ask > self.config.entry_threshold:
