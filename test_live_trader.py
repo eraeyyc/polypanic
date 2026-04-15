@@ -542,6 +542,54 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertIsNone(reason)
         trader.db.close()
 
+    def test_exit_target_logs_acceptance_reason(self):
+        trader = self._build_trader()
+        trader.config.exit_threshold = 0.59
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="down",
+            shares=5.0,
+            avg_cost=0.35,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:down"] = pos
+        with self.assertLogs(level="INFO") as logs:
+            reason = trader.evaluate_exit(
+                "btc-updown-5m-1",
+                "down",
+                best_bid=0.59,
+                seconds_remaining=120.0,
+                btc_delta=0.0,
+            )
+        self.assertEqual(reason, "exit_target")
+        self.assertTrue(any("Exit DOWN accepted" in line for line in logs.output))
+        trader.db.close()
+
+    def test_exit_below_target_logs_skip_reason(self):
+        trader = self._build_trader()
+        trader.config.exit_threshold = 0.59
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="down",
+            shares=5.0,
+            avg_cost=0.35,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:down"] = pos
+        with self.assertLogs(level="INFO") as logs:
+            reason = trader.evaluate_exit(
+                "btc-updown-5m-1",
+                "down",
+                best_bid=0.58,
+                seconds_remaining=120.0,
+                btc_delta=0.0,
+            )
+        self.assertIsNone(reason)
+        self.assertTrue(any("Skipping SELL DOWN" in line for line in logs.output))
+        trader.db.close()
+
     def test_sell_trade_event_stays_tentative_until_onchain_balance_moves(self):
         trader = self._build_trader()
         order = LiveOrderState(

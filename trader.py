@@ -629,6 +629,7 @@ class LiveTrader:
         self._consecutive_errors = 0
         self._kill_switch = False
         self._last_entry_rejection_log: dict[str, tuple[str, float]] = {}
+        self._last_exit_decision_log: dict[str, tuple[str, float]] = {}
         self._allowance_cache: dict[tuple[str, str], dict[str, float]] = {}
         self._balance_cache: dict[str, dict[str, float]] = {}
 
@@ -905,6 +906,14 @@ class LiveTrader:
         if reason != last_reason or now - last_ts >= 15.0:
             logging.info(f"Skipping BUY {side.upper()} — {reason}")
             self._last_entry_rejection_log[key] = (reason, now)
+
+    def _log_exit_decision(self, slug: str, side: str, message: str):
+        key = self._key(slug, side)
+        now = _now_ts()
+        last_message, last_ts = self._last_exit_decision_log.get(key, ("", 0.0))
+        if message != last_message or now - last_ts >= 15.0:
+            logging.info(message)
+            self._last_exit_decision_log[key] = (message, now)
 
     def _allowance_cache_key(self, token_id: str, side: str) -> tuple[str, str]:
         return ("buy", "") if side == "buy" else ("sell", token_id)
@@ -1201,27 +1210,64 @@ class LiveTrader:
                       seconds_remaining: float, btc_delta: float = 0.0) -> Optional[str]:
         pos = self.actual_positions.get(self._key(slug, side))
         if not self._has_sellable_shares(pos):
+            self._log_exit_decision(slug, side, f"Skipping SELL {side.upper()} — no sellable shares")
             return None
         if self._open_order_for(slug, side):
+            self._log_exit_decision(slug, side, f"Skipping SELL {side.upper()} — order already open for side")
             return None
         if best_bid >= self.config.exit_threshold:
+            self._log_exit_decision(
+                slug,
+                side,
+                f"Exit {side.upper()} accepted — bid ${best_bid:.4f} >= target ${self.config.exit_threshold:.4f}",
+            )
             return "exit_target"
         if self.config.stop_loss > 0 and best_bid <= self.config.stop_loss:
             if self.config.stop_loss_after_secs == 0 or seconds_remaining <= self.config.stop_loss_after_secs:
                 btc_confirms = (side == "down" and btc_delta < 0) or (side == "up" and btc_delta > 0)
                 if not btc_confirms:
+                    self._log_exit_decision(
+                        slug,
+                        side,
+                        f"Exit {side.upper()} accepted — bid ${best_bid:.4f} <= stop ${self.config.stop_loss:.4f}",
+                    )
                     return "stop_loss"
         if seconds_remaining <= self.config.force_exit_before_close_secs:
             neutral = self.config.hold_through_close_neutral_btc_range
             if neutral > 0 and abs(btc_delta) <= neutral:
+                self._log_exit_decision(
+                    slug,
+                    side,
+                    f"Skipping SELL {side.upper()} — holding through close in neutral BTC range ({btc_delta:+.2f})",
+                )
                 return None
             t = self.config.hold_through_close_btc_threshold
             if t > 0:
                 if side == "up" and btc_delta >= t:
+                    self._log_exit_decision(
+                        slug,
+                        side,
+                        f"Skipping SELL UP — holding through close with BTC strongly up ({btc_delta:+.2f})",
+                    )
                     return None
                 if side == "down" and btc_delta <= -t:
+                    self._log_exit_decision(
+                        slug,
+                        side,
+                        f"Skipping SELL DOWN — holding through close with BTC strongly down ({btc_delta:+.2f})",
+                    )
                     return None
+            self._log_exit_decision(
+                slug,
+                side,
+                f"Exit {side.upper()} accepted — force exit with {seconds_remaining:.1f}s remaining",
+            )
             return "force_exit"
+        self._log_exit_decision(
+            slug,
+            side,
+            f"Skipping SELL {side.upper()} — bid ${best_bid:.4f} below target ${self.config.exit_threshold:.4f}",
+        )
         return None
 
     def start_heartbeat(self):
