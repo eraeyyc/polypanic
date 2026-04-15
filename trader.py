@@ -804,6 +804,14 @@ class LiveTrader:
     def _constraint(self, token_id: str) -> Optional[MarketConstraints]:
         return self.constraints.get(token_id) or self._refresh_constraints(token_id)
 
+    def _has_sellable_shares(self, pos: Optional[LivePositionState]) -> bool:
+        if not pos or pos.shares <= 0:
+            return False
+        constraint = self._constraint(pos.token_id)
+        if not constraint or constraint.min_order_size <= 0:
+            return pos.shares > 0
+        return pos.shares + 1e-9 >= constraint.min_order_size
+
     def _ensure_buy_capacity(self, notional: float) -> bool:
         if self._kill_switch or not self._market_data_ok:
             return False
@@ -931,7 +939,8 @@ class LiveTrader:
 
     def evaluate_exit(self, slug: str, side: str, best_bid: float,
                       seconds_remaining: float, btc_delta: float = 0.0) -> Optional[str]:
-        if not self.has_position(slug, side):
+        pos = self.actual_positions.get(self._key(slug, side))
+        if not self._has_sellable_shares(pos):
             return None
         if self._open_order_for(slug, side):
             return None
@@ -1049,6 +1058,7 @@ class LiveTrader:
         try:
             rows = self.data_api.get_positions(self.clob.get_address())
             seen = set()
+            now = _now_ts()
             for row in rows:
                 asset_id = row.get("asset") or row.get("asset_id") or row.get("token_id")
                 mapping = self._asset_map.get(asset_id)
@@ -1058,6 +1068,11 @@ class LiveTrader:
                 key = self._key(slug, side)
                 seen.add(key)
                 prev = self.actual_positions.get(key)
+                window_end = self._slug_window_end_ts(slug)
+                if prev and prev.shares > 0 and window_end > 0 and now < window_end:
+                    # During an active market, trust local fills over the lagging Data API.
+                    # Otherwise a stale API snapshot can resurrect shares we already sold.
+                    continue
                 state = LivePositionState(
                     slug=slug,
                     token_id=asset_id,
@@ -1067,7 +1082,7 @@ class LiveTrader:
                     realized_pnl=(prev.realized_pnl if prev else 0.0),
                     total_fees=(prev.total_fees if prev else 0.0),
                     settlement_status=(prev.settlement_status if prev else "open"),
-                    updated_at=_now_ts(),
+                    updated_at=now,
                 )
                 self.actual_positions[key] = state
                 self.db.upsert_live_position(state.to_record())
@@ -1080,11 +1095,11 @@ class LiveTrader:
                     if self._open_order_for(pos.slug, pos.side):
                         continue
                     window_end = self._slug_window_end_ts(pos.slug)
-                    if window_end <= 0 or _now_ts() < window_end:
+                    if window_end <= 0 or now < window_end:
                         # Never clear inventory during an active market window based
                         # solely on temporary Data API absence.
                         continue
-                    if _now_ts() - pos.updated_at < self._missing_position_grace_secs():
+                    if now - pos.updated_at < self._missing_position_grace_secs():
                         # Give the Data API time to converge before clearing inventory.
                         continue
                     logging.warning(
@@ -1438,6 +1453,8 @@ class LiveTrader:
             return
         pos = self.actual_positions.get(self._key(slug, side))
         if not pos or pos.shares <= 0 or self._open_order_for(slug, side):
+            return
+        if constraint.min_order_size > 0 and pos.shares + 1e-9 < constraint.min_order_size:
             return
 
         try:

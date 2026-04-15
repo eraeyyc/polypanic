@@ -286,6 +286,32 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertEqual(len(trader.db.get_live_positions(slug)), 1)
         trader.db.close()
 
+    def test_active_window_data_api_does_not_resurrect_sold_position_size(self):
+        trader = self._build_trader()
+        slug = "btc-updown-5m-100"
+        trader.register_market(slug, "token-up", "token-down", "market-1", "cond-1")
+        local = LivePositionState(
+            slug=slug,
+            token_id="token-down",
+            side="down",
+            shares=0.0012,
+            avg_cost=0.34,
+            updated_at=200.0,
+        )
+        trader.actual_positions[f"{slug}:down"] = local
+        trader.db.upsert_live_position(local.to_record())
+
+        with patch.object(
+            trader.data_api,
+            "get_positions",
+            return_value=[{"asset": "token-down", "size": "8.2424", "avgPrice": "0.34"}],
+        ), patch("trader._now_ts", return_value=250.0):
+            trader._sync_positions_from_data_api()
+
+        pos = trader.actual_positions[f"{slug}:down"]
+        self.assertAlmostEqual(pos.shares, 0.0012)
+        trader.db.close()
+
     def test_entry_rejection_logs_reason(self):
         trader = self._build_trader()
         with self.assertLogs(level="INFO") as logs:
@@ -319,6 +345,27 @@ class LiveStateHandlingTests(unittest.TestCase):
             best_bid=0.12,
             seconds_remaining=10.0,
             btc_delta=-2.5,
+        )
+        self.assertIsNone(reason)
+        trader.db.close()
+
+    def test_unsellable_dust_does_not_trigger_exit(self):
+        trader = self._build_trader()
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="down",
+            shares=0.0012,
+            avg_cost=0.35,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:down"] = pos
+        reason = trader.evaluate_exit(
+            "btc-updown-5m-1",
+            "down",
+            best_bid=0.60,
+            seconds_remaining=60.0,
+            btc_delta=0.0,
         )
         self.assertIsNone(reason)
         trader.db.close()
