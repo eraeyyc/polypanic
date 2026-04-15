@@ -1299,11 +1299,23 @@ class LiveTrader:
                 "raw_json": "",
             })
 
+    _KNOWN_USER_EVENT_TYPES = {"trade", "TRADE", "order", "ORDER"}
+
     def handle_user_event(self, event: dict):
+        etype = event.get("event_type") or event.get("type") or ""
+        if etype and etype not in self._KNOWN_USER_EVENT_TYPES:
+            logging.debug(f"Unknown user event type={etype!r}: {json.dumps(event)[:200]}")
         self._handle_trade_like_event(event)
+
+    _KNOWN_MARKET_EVENT_TYPES = {
+        "book", "price_change", "best_bid_ask", "last_trade_price",
+        "tick_size_change", "market_resolved",
+    }
 
     def handle_market_event(self, event: dict):
         etype = event.get("event_type", "")
+        if etype and etype not in self._KNOWN_MARKET_EVENT_TYPES:
+            logging.debug(f"Unknown market event type={etype!r}: {json.dumps(event)[:200]}")
         if etype == "tick_size_change":
             asset_id = event.get("asset_id")
             if asset_id:
