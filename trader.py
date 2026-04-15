@@ -804,13 +804,18 @@ class LiveTrader:
     def _constraint(self, token_id: str) -> Optional[MarketConstraints]:
         return self.constraints.get(token_id) or self._refresh_constraints(token_id)
 
+    def _shares_are_effectively_flat(self, token_id: str, shares: float) -> bool:
+        if shares <= 1e-9:
+            return True
+        constraint = self._constraint(token_id)
+        if not constraint or constraint.min_order_size <= 0:
+            return False
+        return shares + 1e-9 < constraint.min_order_size
+
     def _has_sellable_shares(self, pos: Optional[LivePositionState]) -> bool:
         if not pos or pos.shares <= 0:
             return False
-        constraint = self._constraint(pos.token_id)
-        if not constraint or constraint.min_order_size <= 0:
-            return pos.shares > 0
-        return pos.shares + 1e-9 >= constraint.min_order_size
+        return not self._shares_are_effectively_flat(pos.token_id, pos.shares)
 
     def _ensure_buy_capacity(self, notional: float) -> bool:
         if self._kill_switch or not self._market_data_ok:
@@ -876,13 +881,18 @@ class LiveTrader:
                 return f"BTC misaligned for UP ({btc_delta:+.2f})"
             if side == "down" and btc_delta > 0:
                 return f"BTC misaligned for DOWN ({btc_delta:+.2f})"
+        other = "down" if side == "up" else "up"
+        if self.config.post_sell_cooldown_secs > 0:
+            other_sell = self._last_sell_time.get(slug, {}).get(other, 0.0)
+            remaining = self.config.post_sell_cooldown_secs - (time.time() - other_sell)
+            if remaining > 0:
+                return f"opposite-side cooldown active after selling {other.upper()} ({remaining:.1f}s remaining)"
         if self.config.btc_momentum_threshold > 0:
             if side == "down" and btc_delta > self.config.btc_momentum_threshold:
                 return f"BTC momentum ${btc_delta:.2f} too positive for DOWN"
             if side == "up" and btc_delta < -self.config.btc_momentum_threshold:
                 return f"BTC momentum ${btc_delta:.2f} too negative for UP"
         if not self.config.allow_both_sides:
-            other = "down" if side == "up" else "up"
             if self.has_position(slug, other) or self._open_order_for(slug, other):
                 return f"opposite side {other.upper()} already active"
         if self.has_position(slug, side):
@@ -1157,9 +1167,9 @@ class LiveTrader:
         remaining = max(0.0, pos.shares - fill_shares)
         pos.realized_pnl += realized
         pos.total_fees += fee_amount
-        pos.shares = remaining
+        pos.shares = 0.0 if self._shares_are_effectively_flat(pos.token_id, remaining) else remaining
         pos.updated_at = _now_ts()
-        if remaining <= 0:
+        if pos.shares <= 0:
             self.db.delete_live_position(pos.slug, pos.token_id, pos.side)
             self.actual_positions.pop(key, None)
         else:
@@ -1257,7 +1267,8 @@ class LiveTrader:
                         order.slug, _parse_ts(event.get("timestamp")), order.side, order.intent,
                         order_id, order.requested_price, price, matched * price, order.intent
                     )
-                    if order.filled_shares + 1e-9 >= order.requested_shares:
+                    remaining = max(0.0, order.requested_shares - order.filled_shares)
+                    if order.filled_shares + 1e-9 >= order.requested_shares or self._shares_are_effectively_flat(order.token_id, remaining):
                         order.status = "filled"
                         self.db.upsert_live_order(order.to_record())
         elif event.get("event_type") == "order" or event.get("size_matched") is not None:

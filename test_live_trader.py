@@ -182,6 +182,47 @@ class LiveAccountingTests(unittest.TestCase):
         self.assertAlmostEqual(pos.total_fees, 0.324, places=6)
         trader.db.close()
 
+    def test_sell_fill_clears_sub_minimum_dust_position(self):
+        trader = self._build_trader()
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="up",
+            shares=8.2412,
+            avg_cost=0.364,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:up"] = pos
+        trader.db.upsert_live_position(pos.to_record())
+
+        sell_order = LiveOrderState(
+            client_order_id="cid-sell",
+            order_id="oid-sell",
+            slug="btc-updown-5m-1",
+            market_id="cond-1",
+            token_id="token-1",
+            side="up",
+            intent="exit_target",
+            order_type="market",
+            tif="FAK",
+            requested_price=0.56,
+            requested_shares=8.2412,
+            requested_notional=4.6151,
+            fee_rate_bps=72,
+            created_at=2.0,
+        )
+        trader._apply_fill_to_positions(
+            sell_order,
+            fill_shares=8.24,
+            fill_price=0.56,
+            fee_amount=0.2030336,
+            fee_asset="USDC",
+        )
+
+        self.assertNotIn("btc-updown-5m-1:up", trader.actual_positions)
+        self.assertEqual(trader.db.get_live_positions("btc-updown-5m-1"), [])
+        trader.db.close()
+
 
 class LiveStateHandlingTests(unittest.TestCase):
     def _build_trader(self):
@@ -328,6 +369,41 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertTrue(any("BTC misaligned for DOWN" in line for line in logs.output))
         trader.db.close()
 
+    def test_entry_rejected_during_opposite_side_cooldown(self):
+        trader = self._build_trader()
+        trader.config.post_sell_cooldown_secs = 10
+        trader._last_sell_time["btc-updown-5m-1"] = {"down": 95.0}
+        with patch("trader.time.time", return_value=100.0), self.assertLogs(level="INFO") as logs:
+            accepted = trader.evaluate_entry(
+                "btc-updown-5m-1",
+                "up",
+                best_ask=0.20,
+                best_bid=0.19,
+                seconds_remaining=120.0,
+                btc_delta=0.0,
+                elapsed_secs=90.0,
+            )
+        self.assertFalse(accepted)
+        self.assertTrue(any("opposite-side cooldown active after selling DOWN" in line for line in logs.output))
+        trader.db.close()
+
+    def test_entry_allowed_after_opposite_side_cooldown_expires(self):
+        trader = self._build_trader()
+        trader.config.post_sell_cooldown_secs = 10
+        trader._last_sell_time["btc-updown-5m-1"] = {"down": 80.0}
+        with patch("trader.time.time", return_value=100.0):
+            accepted = trader.evaluate_entry(
+                "btc-updown-5m-1",
+                "up",
+                best_ask=0.20,
+                best_bid=0.19,
+                seconds_remaining=120.0,
+                btc_delta=0.0,
+                elapsed_secs=90.0,
+            )
+        self.assertTrue(accepted)
+        trader.db.close()
+
     def test_neutral_btc_range_holds_through_close(self):
         trader = self._build_trader()
         pos = LivePositionState(
@@ -368,6 +444,52 @@ class LiveStateHandlingTests(unittest.TestCase):
             btc_delta=0.0,
         )
         self.assertIsNone(reason)
+        trader.db.close()
+
+    def test_trade_event_marks_order_filled_when_only_dust_remains(self):
+        trader = self._build_trader()
+        order = LiveOrderState(
+            client_order_id="cid-sell",
+            order_id="oid-sell",
+            slug="btc-updown-5m-1",
+            market_id="cond-1",
+            token_id="token-1",
+            side="up",
+            intent="exit_target",
+            order_type="market",
+            tif="FAK",
+            requested_price=0.56,
+            requested_shares=8.2412,
+            requested_notional=4.6151,
+            fee_rate_bps=72,
+            created_at=1.0,
+            status="submitted",
+        )
+        trader.open_orders[order.order_id] = order
+        trader.db.upsert_live_order(order.to_record())
+        pos = LivePositionState(
+            slug="btc-updown-5m-1",
+            token_id="token-1",
+            side="up",
+            shares=8.2412,
+            avg_cost=0.364,
+            updated_at=1.0,
+        )
+        trader.actual_positions["btc-updown-5m-1:up"] = pos
+        trader.db.upsert_live_position(pos.to_record())
+
+        trader._handle_trade_like_event({
+            "id": "trade-1",
+            "taker_order_id": "oid-sell",
+            "size": "8.24",
+            "price": "0.56",
+            "status": "MATCHED",
+            "timestamp": "1000",
+        })
+
+        row = trader.db.get_live_order("oid-sell")
+        self.assertEqual(row["status"], "filled")
+        self.assertEqual(trader.db.get_live_positions("btc-updown-5m-1"), [])
         trader.db.close()
 
 

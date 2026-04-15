@@ -26,6 +26,7 @@ import logging
 import argparse
 import signal
 from datetime import datetime, timezone
+from collections import defaultdict
 from dataclasses import dataclass, asdict
 from typing import Optional
 import re
@@ -1346,6 +1347,71 @@ def analyze(db_path: str = "polymarket_observer.db"):
                 r = [t for t in sells if t["reason"] == reason]
                 if r:
                     print(f"  {reason:15s} {len(r):3d} trades  ${sum(t['pnl'] for t in r):+.2f}")
+
+            buy_queues: dict[tuple[str, str], list] = defaultdict(list)
+            round_trips = []
+            local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+
+            for trade in trades:
+                key = (trade["slug"], trade["side"])
+                if trade["action"] == "buy":
+                    buy_queues[key].append(trade)
+                    continue
+                if trade["action"] != "sell" or not buy_queues[key]:
+                    continue
+                entry = buy_queues[key].pop(0)
+                entry_dt = datetime.fromtimestamp(entry["timestamp"], local_tz)
+                round_trips.append({
+                    "slug": trade["slug"],
+                    "side": trade["side"],
+                    "entry_hour": entry_dt.hour,
+                    "pnl": trade["pnl"] or 0.0,
+                    "reason": trade["reason"] or "",
+                })
+
+            if round_trips:
+                print(f"\n{'─' * 70}")
+                print(f"PAPER TRADE TIMING ({local_tz})")
+                print(f"{'─' * 70}")
+
+                def _print_bucket(label: str, rows: list[dict]):
+                    total = sum(r["pnl"] for r in rows)
+                    wins = sum(1 for r in rows if r["pnl"] > 0)
+                    print(f"  {label:10s} {len(rows):3d} trades  ${total:+.2f}  "
+                          f"avg ${total/len(rows):+.2f}  win {wins/len(rows)*100:4.1f}%")
+
+                session_buckets = {
+                    "Overnight": [r for r in round_trips if 1 <= r["entry_hour"] < 4],
+                    "Business":  [r for r in round_trips if 8 <= r["entry_hour"] < 16],
+                    "Evening":   [r for r in round_trips if 16 <= r["entry_hour"] < 22],
+                }
+                for label, rows in session_buckets.items():
+                    if rows:
+                        _print_bucket(label, rows)
+
+                print("\n  By local entry hour:")
+                by_hour: dict[int, list[dict]] = defaultdict(list)
+                for trip in round_trips:
+                    by_hour[trip["entry_hour"]].append(trip)
+                for hour in sorted(by_hour):
+                    rows = by_hour[hour]
+                    total = sum(r["pnl"] for r in rows)
+                    wins = sum(1 for r in rows if r["pnl"] > 0)
+                    print(f"    {hour:02d}:00  {len(rows):3d} trades  ${total:+.2f}  "
+                          f"avg ${total/len(rows):+.2f}  win {wins/len(rows)*100:4.1f}%")
+
+                print("\n  By exit reason:")
+                by_reason: dict[str, list[dict]] = defaultdict(list)
+                for trip in round_trips:
+                    by_reason[trip["reason"]].append(trip)
+                for reason in ("exit_target", "stop_loss", "force_exit", "resolution"):
+                    rows = by_reason.get(reason, [])
+                    if not rows:
+                        continue
+                    total = sum(r["pnl"] for r in rows)
+                    wins = sum(1 for r in rows if r["pnl"] > 0)
+                    print(f"    {reason:12s} {len(rows):3d} trades  ${total:+.2f}  "
+                          f"avg ${total/len(rows):+.2f}  win {wins/len(rows)*100:4.1f}%")
         print(f"\n  Final bankroll: ${trades[-1]['bankroll_after']:.2f}")
 
     db.close()
