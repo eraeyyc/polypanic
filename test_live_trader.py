@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from observer import Database
@@ -17,6 +18,7 @@ class DummyClob:
     def __init__(self):
         self.fail_post_order = False
         self.balance_allowance_calls = 0
+        self.builder = None
 
     def get_order_book(self, token_id):
         class _Book:
@@ -51,9 +53,11 @@ class DummyBalanceClient:
         self.balances = {}
         self.calls = 0
         self.fail = False
+        self.last_address = None
 
     def get_token_balance(self, address, token_id):
         self.calls += 1
+        self.last_address = address
         if self.fail:
             raise RuntimeError("rpc boom")
         return self.balances.get(token_id, 0.0)
@@ -347,6 +351,30 @@ class LiveStateHandlingTests(unittest.TestCase):
         with patch("trader._now_ts", return_value=101.0):
             self.assertTrue(trader._check_allowance("token-1", "buy", expected_shares=10.0, expected_notional=3.8))
         self.assertEqual(trader.clob.balance_allowance_calls, 1)
+        trader.db.close()
+
+    def test_onchain_balance_uses_funder_address_when_present(self):
+        trader = self._build_trader()
+        trader.clob.builder = SimpleNamespace(funder="0xFUNDER")
+        trader._position_owner = trader._resolve_position_owner()
+
+        trader.balance_api.balances["token-1"] = 7.5
+        shares = trader._get_onchain_balance("token-1", use_cache=False)
+
+        self.assertEqual(shares, 7.5)
+        self.assertEqual(trader._position_owner_address(), "0xfunder")
+        self.assertEqual(trader.balance_api.last_address, "0xfunder")
+        trader.db.close()
+
+    def test_data_api_position_sync_uses_funder_address_when_present(self):
+        trader = self._build_trader()
+        trader.clob.builder = SimpleNamespace(funder="0xFUNDER")
+        trader._position_owner = trader._resolve_position_owner()
+
+        with patch.object(trader.data_api, "get_positions", return_value=[]) as mocked:
+            trader._sync_positions_from_data_api()
+
+        mocked.assert_called_once_with("0xfunder")
         trader.db.close()
 
     def test_missing_data_api_position_clears_stale_local_inventory(self):

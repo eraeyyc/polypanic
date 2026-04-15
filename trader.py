@@ -613,6 +613,7 @@ class LiveTrader:
         self.clob = clob
         self.data_api = DataAPIClient()
         self.balance_api = PolygonBalanceClient()
+        self._position_owner = self._resolve_position_owner()
 
         self.desired_positions: dict[str, str] = {}  # slug:side -> reason
         self.open_orders: dict[str, LiveOrderState] = {}  # order_id/client_id -> state
@@ -639,6 +640,15 @@ class LiveTrader:
         self._last_positions_sync = 0.0
 
         self._load_state_from_db()
+
+    def _resolve_position_owner(self) -> str:
+        builder = getattr(self.clob, "builder", None)
+        funder = getattr(builder, "funder", None)
+        signer = self.clob.get_address()
+        return (funder or signer or "").lower()
+
+    def _position_owner_address(self) -> str:
+        return self._position_owner
 
     @property
     def bankroll(self) -> float:
@@ -920,7 +930,7 @@ class LiveTrader:
         cached = self._balance_cache.get(token_id)
         if use_cache and cached and now - cached.get("ts", 0.0) <= self._balance_cache_ttl():
             return cached.get("shares", 0.0)
-        shares = self.balance_api.get_token_balance(self.clob.get_address(), token_id)
+        shares = self.balance_api.get_token_balance(self._position_owner_address(), token_id)
         self._balance_cache[token_id] = {"ts": now, "shares": shares}
         return shares
 
@@ -1308,7 +1318,7 @@ class LiveTrader:
 
     def _sync_positions_from_data_api(self):
         try:
-            rows = self.data_api.get_positions(self.clob.get_address())
+            rows = self.data_api.get_positions(self._position_owner_address())
             seen = set()
             now = _now_ts()
             for row in rows:
