@@ -680,6 +680,23 @@ class LiveTrader:
             )
             self.actual_positions[self._key(row["slug"], row["side"])] = state
 
+        # Settle any positions left over from markets that resolved before this session.
+        # Collect slugs first to avoid mutating actual_positions mid-iteration.
+        slugs_to_settle = {}
+        for pos in self.actual_positions.values():
+            if pos.shares <= 0 or pos.settlement_status == "settled":
+                continue
+            mkt = self.db.get_live_market_state(pos.slug)
+            if mkt and mkt["resolved"] and mkt["winning_token_id"]:
+                slugs_to_settle[pos.slug] = (
+                    mkt["winning_token_id"],
+                    mkt["resolution_outcome"] or "",
+                    mkt["market_id"] or "",
+                )
+        for slug, (winning_token_id, outcome, market_id) in slugs_to_settle.items():
+            logging.info(f"Startup: settling resolved market {slug} (outcome={outcome})")
+            self._settle_market(slug, winning_token_id, outcome, market_id=market_id)
+
     def register_market(self, slug: str, up_token: str, down_token: str, market_id: str = "", condition_id: str = ""):
         self._tokens[slug] = {
             "up": up_token,
@@ -1239,6 +1256,49 @@ class LiveTrader:
             order.raw_json = json.dumps(event)
             self.db.upsert_live_order(order.to_record())
 
+    def _settle_market(self, slug: str, winning_token_id: str, outcome: str, market_id: str = ""):
+        """
+        Apply final settlement P&L for all open positions in a resolved market.
+
+        Winning shares pay out at $1.00; losing shares pay out at $0.00.
+        Positions are removed from active tracking after settlement.
+        """
+        resolved_any = False
+        for key, pos in list(self.actual_positions.items()):
+            if pos.slug != slug or pos.shares <= 0:
+                continue
+            is_winner = bool(winning_token_id) and (pos.token_id == winning_token_id)
+            settlement_price = 1.0 if is_winner else 0.0
+            settlement_pnl = (settlement_price - pos.avg_cost) * pos.shares
+            result_label = "WIN" if is_winner else "LOSS"
+            logging.info(
+                f"   💰 Settlement {result_label} {pos.side.upper()} {slug} | "
+                f"{pos.shares:.4f} shares × avg_cost ${pos.avg_cost:.4f} → "
+                f"${settlement_price:.2f} | settlement P&L: {settlement_pnl:+.4f}"
+            )
+            pos.realized_pnl += settlement_pnl
+            pos.shares = 0.0
+            pos.settlement_status = "settled"
+            pos.updated_at = _now_ts()
+            # Write final realized_pnl before deletion so it survives in DB history.
+            self.db.upsert_live_position(pos.to_record())
+            self.db.delete_live_position(pos.slug, pos.token_id, pos.side)
+            self.actual_positions.pop(key, None)
+            resolved_any = True
+
+        if resolved_any or winning_token_id:
+            mkt_id = market_id or self._market(slug)
+            self.db.upsert_live_market_state({
+                "slug": slug,
+                "market_id": mkt_id,
+                "resolved": 1,
+                "resolution_outcome": outcome,
+                "winning_token_id": winning_token_id,
+                "settlement_status": "settled",
+                "updated_at": _now_ts(),
+                "raw_json": "",
+            })
+
     def handle_user_event(self, event: dict):
         self._handle_trade_like_event(event)
 
@@ -1256,16 +1316,22 @@ class LiveTrader:
             for slug, meta in self._tokens.items():
                 if market_id and market_id not in {meta.get("condition_id"), meta.get("market_id")}:
                     continue
-                self.db.upsert_live_market_state({
-                    "slug": slug,
-                    "market_id": meta.get("condition_id") or meta.get("market_id", ""),
-                    "resolved": 1,
-                    "resolution_outcome": outcome,
-                    "winning_token_id": winning_asset,
-                    "settlement_status": "pending_reconciliation",
-                    "updated_at": _now_ts(),
-                    "raw_json": json.dumps(event),
-                })
+                mkt_id = meta.get("condition_id") or meta.get("market_id", "")
+                if winning_asset:
+                    # Full settlement: compute P&L and remove positions.
+                    self._settle_market(slug, winning_asset, outcome, market_id=mkt_id)
+                else:
+                    # Resolution without a winning_asset — record but don't settle yet.
+                    self.db.upsert_live_market_state({
+                        "slug": slug,
+                        "market_id": mkt_id,
+                        "resolved": 1,
+                        "resolution_outcome": outcome,
+                        "winning_token_id": winning_asset,
+                        "settlement_status": "pending_reconciliation",
+                        "updated_at": _now_ts(),
+                        "raw_json": json.dumps(event),
+                    })
 
     def execute_buy(self, slug: str, side: str, price: float, now: float, context=None):
         token_id = self._token(slug, side)
