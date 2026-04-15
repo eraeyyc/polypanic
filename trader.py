@@ -1499,22 +1499,33 @@ class LiveTrader:
             self._record_error(f"SELL order failed ({side} @ ${price:.4f}): {exc}")
 
     def cancel_market(self, slug: str):
+        # Only hit the exchange if we actually have open orders — some APIs return
+        # an error on cancel_market_orders when there are no orders to cancel, and
+        # we don't want that to increment _consecutive_errors toward the kill switch.
+        open_order_ids = [
+            o.order_id
+            for o in self.open_orders.values()
+            if o.slug == slug and o.status not in TERMINAL_ORDER_STATUSES and o.order_id
+        ]
+        if not open_order_ids:
+            return
+
         market_id = self._market(slug)
         try:
             if market_id:
                 self.clob.cancel_market_orders(market=market_id)
             else:
-                for side in ("up", "down"):
-                    order = self._open_order_for(slug, side)
-                    if order and order.order_id:
-                        self.clob.cancel(order.order_id)
+                for order_id in open_order_ids:
+                    self.clob.cancel(order_id)
             for order in self.open_orders.values():
                 if order.slug == slug and order.status not in {"filled", "confirmed", "failed"}:
                     order.status = "cancel_pending"
                     order.updated_at = _now_ts()
                     self.db.upsert_live_order(order.to_record())
         except Exception as exc:
-            self._record_error(f"Cancel market failed for {slug}: {exc}")
+            # Cancel failures at window close should not trip the kill switch on
+            # the next window. Log but don't increment _consecutive_errors.
+            logging.warning(f"Cancel market failed for {slug}: {exc}")
 
     def mark_settlement_pending(self, slug: str):
         state = self.db.get_live_market_state(slug)
