@@ -838,18 +838,23 @@ class PaperTrader:
                 return False
             if side == "down" and btc_delta > 0:
                 return False
+        other = "down" if side == "up" else "up"
+        if self.config.post_sell_cooldown_secs > 0:
+            other_sell = self._last_sell_time.get(slug, {}).get(other, 0.0)
+            if time.time() - other_sell < self.config.post_sell_cooldown_secs:
+                return False
         if self.config.btc_momentum_threshold > 0:
             if side == "down" and btc_delta > self.config.btc_momentum_threshold:
                 return False
             if side == "up" and btc_delta < -self.config.btc_momentum_threshold:
                 return False
         if not self.config.allow_both_sides:
-            other = "down" if side == "up" else "up"
             if self.has_position(slug, other):
                 return False
         if self.has_position(slug, side):
             return False
-        if self.bankroll < self.config.min_position_usdc:
+        size = min(self.config.max_position_size, self.bankroll)
+        if size < self.config.min_position_usdc:
             return False
         return True
 
@@ -1108,8 +1113,8 @@ class Observer:
                         up_change_10s=up_change_10s, down_change_10s=down_change_10s,
                     )
 
-                    deployed   = sum(p.size for p in self.trader.get_positions(slug))
-                    window_pnl = (self.trader.bankroll + deployed) - self._window_start_bankroll
+                    marked_value = self._marked_position_value(slug, up_mid, down_mid)
+                    window_pnl = (self.trader.bankroll + marked_value) - self._window_start_bankroll
                     pnl_str    = _colored(f"ROI {window_pnl:+.2f}", _GREEN if window_pnl >= 0 else _RED)
 
                     logging.info(
@@ -1182,6 +1187,12 @@ class Observer:
     def _on_before_close(self):
         """Called just before db.close() — override in subclasses to stop background threads."""
         pass
+
+    def _marked_position_value(self, slug: str, up_mid: float, down_mid: float) -> float:
+        total = 0.0
+        for pos in self.trader.get_positions(slug):
+            total += pos.shares * (up_mid if pos.side == "up" else down_mid)
+        return total
 
     def _finalize_market(self, slug: str):
         """Resolve any open positions when a window closes."""

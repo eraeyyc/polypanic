@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from observer import Database
+from observer import PaperTrader, StrategyConfig
 from trader import (
     LiveOrderState,
     LivePositionState,
@@ -15,6 +16,7 @@ from trader import (
 class DummyClob:
     def __init__(self):
         self.fail_post_order = False
+        self.balance_allowance_calls = 0
 
     def get_order_book(self, token_id):
         class _Book:
@@ -29,6 +31,7 @@ class DummyClob:
         return 0.38
 
     def get_balance_allowance(self, params):
+        self.balance_allowance_calls += 1
         return {"balance": "1000", "allowance": "1000"}
 
     def create_market_order(self, args):
@@ -51,6 +54,49 @@ class TickRoundingTests(unittest.TestCase):
     def test_round_down_to_tick(self):
         self.assertEqual(_round_down_to_tick(0.6839, 0.01), 0.68)
         self.assertEqual(_round_down_to_tick(0.6839, 0.0001), 0.6839)
+
+
+class PaperTraderBehaviorTests(unittest.TestCase):
+    def _build_trader(self):
+        return PaperTrader(StrategyConfig(), Database(":memory:"))
+
+    def test_opposite_side_is_blocked_during_post_sell_cooldown(self):
+        trader = self._build_trader()
+        trader.config.post_sell_cooldown_secs = 10
+        trader._last_sell_time["btc-updown-5m-1"] = {"down": 95.0}
+
+        with patch("observer.time.time", return_value=100.0):
+            accepted = trader.evaluate_entry(
+                "btc-updown-5m-1",
+                "up",
+                best_ask=0.20,
+                best_bid=0.19,
+                seconds_remaining=120.0,
+                btc_delta=0.0,
+                elapsed_secs=90.0,
+            )
+
+        self.assertFalse(accepted)
+        trader.db.close()
+
+    def test_entry_rejected_when_effective_trade_size_is_below_minimum(self):
+        trader = self._build_trader()
+        trader.config.max_position_size = 2.0
+        trader.config.min_position_usdc = 5.0
+        trader.bankroll = 10.0
+
+        accepted = trader.evaluate_entry(
+            "btc-updown-5m-1",
+            "up",
+            best_ask=0.20,
+            best_bid=0.19,
+            seconds_remaining=120.0,
+            btc_delta=0.0,
+            elapsed_secs=90.0,
+        )
+
+        self.assertFalse(accepted)
+        trader.db.close()
 
 
 class LiveDatabaseTests(unittest.TestCase):
@@ -279,6 +325,15 @@ class LiveStateHandlingTests(unittest.TestCase):
         self.assertEqual(orders[0]["status"], "failed")
         self.assertIn("boom", orders[0]["error_text"])
         self.assertEqual(trader.open_orders, {})
+        trader.db.close()
+
+    def test_allowance_preflight_uses_short_lived_cache(self):
+        trader = self._build_trader()
+        with patch("trader._now_ts", return_value=100.0):
+            self.assertTrue(trader._check_allowance("token-1", "buy", expected_shares=10.0, expected_notional=3.8))
+        with patch("trader._now_ts", return_value=101.0):
+            self.assertTrue(trader._check_allowance("token-1", "buy", expected_shares=10.0, expected_notional=3.8))
+        self.assertEqual(trader.clob.balance_allowance_calls, 1)
         trader.db.close()
 
     def test_missing_data_api_position_clears_stale_local_inventory(self):

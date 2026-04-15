@@ -583,6 +583,7 @@ class LiveTrader:
         self._consecutive_errors = 0
         self._kill_switch = False
         self._last_entry_rejection_log: dict[str, tuple[str, float]] = {}
+        self._allowance_cache: dict[tuple[str, str], dict[str, float]] = {}
 
         self._hb_id: Optional[str] = None
         self._hb_stop = threading.Event()
@@ -844,6 +845,22 @@ class LiveTrader:
             logging.info(f"Skipping BUY {side.upper()} — {reason}")
             self._last_entry_rejection_log[key] = (reason, now)
 
+    def _allowance_cache_key(self, token_id: str, side: str) -> tuple[str, str]:
+        return ("buy", "") if side == "buy" else ("sell", token_id)
+
+    def _allowance_cache_ttl(self) -> float:
+        return 2.0
+
+    def _consume_allowance_cache(self, token_id: str, side: str, shares: float, notional: float):
+        key = self._allowance_cache_key(token_id, side)
+        cached = self._allowance_cache.get(key)
+        if not cached:
+            return
+        required = notional if side == "buy" else shares
+        cached["balance"] = max(0.0, cached.get("balance", 0.0) - required)
+        cached["allowance"] = max(0.0, cached.get("allowance", 0.0) - required)
+        cached["ts"] = _now_ts()
+
     def _entry_rejection_reason(self, slug: str, side: str, best_ask: float,
                                 best_bid: float, seconds_remaining: float,
                                 btc_delta: float = 0.0, elapsed_secs: float = 0.0) -> Optional[str]:
@@ -906,27 +923,45 @@ class LiveTrader:
 
     def _check_allowance(self, token_id: str, side: str, expected_shares: float, expected_notional: float) -> bool:
         try:
-            if side == "buy":
-                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-                resp = self.clob.get_balance_allowance(params)
+            cache_key = self._allowance_cache_key(token_id, side)
+            cached = self._allowance_cache.get(cache_key)
+            now = _now_ts()
+            if cached and now - cached.get("ts", 0.0) <= self._allowance_cache_ttl():
+                balance = cached.get("balance", 0.0)
+                allowance = cached.get("allowance", 0.0)
+                has_balance = cached.get("has_balance", 1.0) > 0
+                has_allowance = cached.get("has_allowance", 1.0) > 0
             else:
-                params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-                resp = self.clob.get_balance_allowance(params)
-            raw_balance = resp.get("balance")
-            if raw_balance is None:
-                raw_balance = resp.get("available")
-            raw_allowance = resp.get("allowance")
-            if raw_allowance is None:
-                raw_allowance = resp.get("approved")
-            balance = _safe_float(raw_balance)
-            allowance = _safe_float(raw_allowance)
+                if side == "buy":
+                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                    resp = self.clob.get_balance_allowance(params)
+                else:
+                    params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                    resp = self.clob.get_balance_allowance(params)
+                raw_balance = resp.get("balance")
+                if raw_balance is None:
+                    raw_balance = resp.get("available")
+                raw_allowance = resp.get("allowance")
+                if raw_allowance is None:
+                    raw_allowance = resp.get("approved")
+                balance = _safe_float(raw_balance)
+                allowance = _safe_float(raw_allowance)
+                has_balance = raw_balance is not None
+                has_allowance = raw_allowance is not None
+                self._allowance_cache[cache_key] = {
+                    "ts": now,
+                    "balance": balance,
+                    "allowance": allowance,
+                    "has_balance": 1.0 if has_balance else 0.0,
+                    "has_allowance": 1.0 if has_allowance else 0.0,
+                }
             required = expected_notional if side == "buy" else expected_shares
-            if raw_balance is not None and balance + 1e-9 < required:
+            if has_balance and balance + 1e-9 < required:
                 logging.warning(
                     f"Skipping {side.upper()} — balance {balance:.4f} below required {required:.4f}"
                 )
                 return False
-            if raw_allowance is not None and allowance + 1e-9 < required:
+            if has_allowance and allowance + 1e-9 < required:
                 logging.warning(
                     f"Skipping {side.upper()} — allowance {allowance:.4f} below required {required:.4f}"
                 )
@@ -1438,6 +1473,7 @@ class LiveTrader:
                 )
             )
             resp = self.clob.post_order(signed, OrderType.FAK)
+            self._consume_allowance_cache(token_id, "buy", est_shares, size_usdc)
             order_state.order_id = resp.get("orderID", "")
             order_state.status = (resp.get("status") or "submitted").lower()
             order_state.updated_at = _now_ts()
@@ -1517,6 +1553,7 @@ class LiveTrader:
                 )
             )
             resp = self.clob.post_order(signed, OrderType.FAK)
+            self._consume_allowance_cache(token_id, "sell", pos.shares, pos.shares * est_price)
             order_state.order_id = resp.get("orderID", "")
             order_state.status = (resp.get("status") or "submitted").lower()
             order_state.updated_at = _now_ts()
