@@ -8,71 +8,113 @@ Context for the next session.
 
 ## Current state
 
-**Live trading is working.** End-to-end confirmed:
-- Auth (POLY_PROXY, signature_type=1) ✅
-- Order signing and submission ✅
-- FAK fill execution ✅
-- Fee tracking ✅
-- Realized P&L accounting ✅
-- Shutdown (clean thread teardown) ✅
+Live trading is functional, but this repo is still in active debugging and tuning, not “set and forget” mode.
 
-Polymarket balance after smoke test: $32.17 from $17 deposited.
+What is currently true:
+- live auth / signing / order submission works
+- fill tracking and realized P&L accounting work
+- paper and live strategy logic are mostly aligned again
+- several major live-state bugs have been fixed
+- the best next step is more clean live testing, especially during regular business hours
 
-Working tree is clean. All changes committed.
+Do not treat older logs / DBs as clean strategy evidence. A number of historical runs were contaminated by state bugs that have since been fixed.
 
-## Live run command
+## Current recommended live run
+
+Use `./run.sh` so the repo virtualenv is activated, and use a fresh DB per session:
 
 ```bash
-caffeinate -i python trader.py \
+cd /Users/MAC/projects/polypanic
+
+export POLYMARKET_PRIVATE_KEY=0x...
+export POLYMARKET_SIGNATURE_TYPE=1
+export POLYMARKET_FUNDER=0x...
+
+./run.sh trader.py \
   --entry 0.38 \
-  --exit 0.70 \
-  --entry-delay 60 \
-  --max-entry-age 150 \
-  --min-entry 0.15 \
-  --max-position 5 \
-  --bankroll 20 \
-  --db polymarket_live.db
+  --exit 0.54 \
+  --entry-delay 20 \
+  --max-entry-age 240 \
+  --min-entry 0.18 \
+  --cooldown 10 \
+  --max-position 3 \
+  --min-position 1 \
+  --bankroll 10 \
+  --max-total-exposure 10 \
+  --max-open-orders 2 \
+  --allow-contrarian \
+  --both-sides \
+  --hold-threshold 15 \
+  --hold-neutral-range 5 \
+  --db polymarket_live10.db \
+  --log-level INFO
 ```
 
-Scale `--max-position` and `--bankroll` up after a few clean cycles.
+Notes:
+- Use a new `--db` file for each clean test session.
+- Do not manually trade the same market on the Polymarket website while the bot is running.
+- If using an EOA instead of proxy/funder mode, use the correct `signature_type` and env vars.
 
-## Strategy parameters (paper-validated baseline)
+## Current strategy picture
 
-- Entry: `<= 0.38`
-- Exit: `>= 0.70`
-- `entry_delay=60`, `max_entry_age=150`
-- `min_entry=0.15`
-- Single-side, BTC-aligned by default
+Paper analysis from `polymarket_observer_100.db` suggests:
+- business-hour paper performance is materially better than overnight
+- `exit_target` trades are strong
+- `force_exit` is still the biggest drag
 
-## Bugs fixed this session
+Do not overfit yet. The live sample is still too small and too noisy from prior debugging sessions.
 
-1. **UNIQUE constraint on `order_id`** — failed FAK orders left `order_id=""` in DB; retries collided. Fixed by seeding `order_id = client_order_id` before first DB write in `execute_buy` / `execute_sell`.
+## Major fixes already shipped
 
-2. **Reconcile thread using closed DB on shutdown** — `Observer.run()` closed the DB before `LiveObserver` stopped the reconcile thread. Fixed with `_on_before_close()` hook in `Observer`.
+### Live-state / execution fixes
 
-3. **Stale orders blocking all entries after restart** — On restart, `_load_state_from_db` loaded orders with status `pending_submit` / `cancel_pending` from closed windows into `open_orders`. These counted against `max_open_live_orders=4`, so 5 stale orders from the first session silently blocked every `evaluate_entry` call in all 6 subsequent markets. Fixed: `_load_state_from_db` now detects non-terminal orders for windows that closed >60s ago and marks them `cancelled` (both in memory and DB) before they enter `open_orders`. Added `_slug_window_end_ts()` helper to extract the window timestamp from the slug.
+1. Terminal order handling now treats `closed` as terminal, so disappeared FAK orders no longer block new entries.
+2. Transient market-data failures no longer permanently trip the live kill switch.
+3. Failed submissions are marked `failed` instead of persisting forever as `pending_submit`.
+4. Manual/external sells no longer leave permanent ghost inventory.
+5. Active-window positions are no longer cleared just because the Data API temporarily misses them.
+6. Entry rejection reasons are now logged, which makes “why didn’t it buy?” diagnosable.
+7. Near-close neutral BTC behavior was changed so the bot can hold through resolution when BTC is still within a small neutral range instead of forcing out at a terrible last-second price.
+8. Successful sell fills that leave only sub-minimum dust are now treated as flat positions, and the corresponding orders are marked effectively filled.
+9. Data API position sync no longer resurrects stale position size during an active window after a real sell.
 
-4. **`reserved_notional()` always returned 0** — Checked `order.side == "buy"` but `order.side` stores `"up"` / `"down"`. Changed to `order.intent == "buy"`. This was a silent bug that could have allowed over-exposure if many buy orders were open simultaneously; in practice it was masked by the open-orders count gate.
+### Paper/live strategy alignment fixes
+
+1. ROI display is now mark-to-market in `observer.py`, so both paper and live show unrealized P&L correctly instead of looking artificially flat after entry.
+2. Paper trader now applies opposite-side post-sell cooldown the same way live trader does.
+3. Paper trader now rejects sub-minimum effective trades when `min(max_position_size, bankroll) < min_position_usdc`, matching live behavior.
+
+### Latency / order-path improvement
+
+1. Live allowance/balance preflight now uses a short-lived cache, reducing redundant REST calls during repeated entry/exit attempts.
 
 ## What still needs watching
 
-- **State reload mid-window** — stale order expiry uses a 60s grace period after window close, so if the bot is stopped and restarted within the same 5-minute window, reload behaves correctly (orders aren't yet expired). Watch behavior across a restart mid-position.
-- **Stale positions from closed windows** — `live_positions` with `settlement_status='open'` from resolved windows are loaded and eat into `bankroll` via `position_cost_basis()`. They don't block entries (slug-scoped checks), but they do reduce spendable capital until settlement reconciliation clears them. Priority: fix settlement reconciliation.
-- **Settlement reconciliation** — positions held through window close should get marked `settlement_pending`. Verify those reconcile correctly once the market resolves.
-- **User WebSocket payload shapes** — only lightly exercised. If event parsing breaks, the reconcile loop will catch it via REST fallback, but log noise will increase.
+### Strategy / market behavior
+
+- Force-exit remains the biggest P&L drag in paper results.
+- Regular business-hour liquidity likely matters a lot; most early live tests were at bad overnight hours.
+- The strategy is still being tuned empirically. Do not assume the current `0.54` exit is final.
+
+### Live execution / infra
+
+- User WebSocket payload coverage is still limited; reconciliation is the safety net.
+- Partial-fill and unusual order-state paths need more live exposure.
+- Settlement-through-resolution needs more real-world validation.
+- Exchange/API latency still dominates local logic time; if the bot feels slow, look at network-bound preflight and reconciliation work first, not `if` statements.
 
 ## Things not to regress
 
-- Do not revert to optimistic fills.
-- Do not use `live_trades` as canonical accounting — use `live_orders`, `live_fills`, `live_positions`.
-- Do not switch back to both-sides or the old `0.40 / 0.65` config.
-- Do not remove the `_on_before_close()` shutdown ordering — it prevents the DB-closed crash.
-- Do not remove `order_id = client_order_id` seeding — it prevents the UNIQUE constraint cascade.
-- Do not remove `_slug_window_end_ts` stale-order expiry — it prevents phantom orders from blocking future entries.
+- Do not revert the dust-fill handling. It prevents fake residual positions from blocking future trades.
+- Do not revert active-window protection in Data API position sync. It prevents stale API snapshots from resurrecting sold positions.
+- Do not revert failed-order persistence to `failed`.
+- Do not remove entry-rejection logging; it is now the fastest way to debug non-entries.
+- Do not revert the mark-to-market ROI display.
+- Do not revert paper/live alignment on cooldown and min-position behavior.
 
-## Files
+## Useful files
 
-- `observer.py` — base observer, DB schema, paper trader
-- `trader.py` — live trader, WebSocket, auth
-- `test_live_trader.py` — unit tests (tick rounding, DB round-trips, fee math)
-- `STATUS.md` — current status and run commands
+- `observer.py` — base observer, paper trader, analysis path, shared strategy logic
+- `trader.py` — live trader, exchange integration, reconciliation, heartbeats
+- `test_live_trader.py` — regression tests for live-state and shared strategy logic
+- `STATUS.md` — current operational summary

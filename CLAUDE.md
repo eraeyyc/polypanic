@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## Commands
 
@@ -8,107 +8,151 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pip install requests py-clob-client websockets flask
 
-# Run observer (paper trading + data collection, no auth needed)
+# Run observer / paper trader
 python observer.py
-python observer.py --entry 0.38 --exit 0.68 --min-entry 0.15 --bankroll 500
+python observer.py --entry 0.38 --exit 0.54 --min-entry 0.18 --cooldown 10 --bankroll 500
 
 # Analyze collected data
 python observer.py --analyze
+python observer.py --analyze --db polymarket_observer_100.db
 
-# One-time live trading setup (generates ~/.polypanic/keys.json)
+# Set up live credentials
 python trader.py --setup-keys --private-key 0x...
 
-# Run live trader
-python trader.py --private-key 0x...
-python trader.py --max-position 5 --entry 0.38 --exit 0.68
-# or via env var:
-export POLYMARKET_PRIVATE_KEY=0x...
-python trader.py
+# Preferred live run path
+./run.sh trader.py \
+  --entry 0.38 \
+  --exit 0.54 \
+  --entry-delay 20 \
+  --max-entry-age 240 \
+  --min-entry 0.18 \
+  --cooldown 10 \
+  --max-position 3 \
+  --min-position 1 \
+  --bankroll 10 \
+  --max-total-exposure 10 \
+  --max-open-orders 2 \
+  --allow-contrarian \
+  --both-sides \
+  --hold-threshold 15 \
+  --hold-neutral-range 5 \
+  --db polymarket_live10.db \
+  --log-level INFO
 ```
 
-No build step, no test suite — these are single-file scripts. Syntax-check with:
+Tests:
+
+```bash
+python3 -m unittest test_live_trader.py
+```
+
+Syntax checks:
+
 ```bash
 python3 -c "import ast; ast.parse(open('observer.py').read())"
 python3 -c "import ast; ast.parse(open('trader.py').read())"
+python3 -c "import ast; ast.parse(open('test_live_trader.py').read())"
 ```
 
 ## Architecture
 
-Two files with a clean inheritance relationship:
+The repo has two main Python entrypoints with a shared strategy layer:
 
-**`observer.py`** — self-contained, no auth. Run this first to collect data and validate the strategy in paper mode before touching real money.
-- `StrategyConfig` — all tunable parameters (entry/exit thresholds, position sizing, timing). Key fields:
-  - `entry_threshold` (default 0.40) — buy when ask ≤ this
-  - `min_entry_price` (default 0.15) — reject entries below this; avoids near-dead markets
-  - `exit_threshold` (default 0.65) — sell when bid ≥ this
-  - `stop_loss` (default 0.0 = disabled) — sell if bid drops to this
-  - `stop_loss_after_secs` (default 60) — only fire stop_loss in the final N seconds of the window
-  - `max_entry_spread` (default 0.06) — reject entry if bid/ask spread is too wide
-- `PolymarketClient` — read-only REST client. Market slugs are deterministic: `btc-updown-5m-{floor(unix_ts/300)*300}`, so no scanning needed.
-- `BTCPriceClient` — BTC spot price with fallback chain: Coinbase → Kraken → Binance → CoinGecko
-- `Database` — SQLite with 5 tables: `markets`, `price_ticks`, `paper_trades`, `live_trades`, `strategy_config`. WAL mode + NORMAL sync enabled. Tick inserts are batched (commit every 10); trade/market inserts commit immediately. `flush_ticks()` called at window close and shutdown.
-- `PaperTrader` — simulated execution. Tracks positions per slug, evaluates entry/exit conditions, handles resolution if still holding at window end.
-- `Observer` — main loop. Designed for subclassing: override `_get_prices()` for non-REST sources, `_on_new_market()` for per-window setup hooks, `_mode_label()` for display. Accepts an optional `trader=` param so subclasses can inject a different trader.
-- `analyze()` — post-hoc swing analysis and paper trading results from the DB
+**`observer.py`**
+- shared `StrategyConfig`
+- paper trading engine (`PaperTrader`)
+- main observer loop (`Observer`)
+- database schema and helpers
+- analytics path via `analyze()`
 
-**`trader.py`** — imports from `observer.py`, adds live execution:
-- `_TokenBook` / `PriceWebSocket` — background asyncio thread maintaining in-memory order books from the Polymarket WebSocket (`wss://ws-subscriptions-clob.polymarket.com/ws/market`). Handles `book` (full snapshot) and `price_change` (delta) events. `get_prices()` returns `None` if data is >5s stale so the caller falls back to REST.
-- `LiveTrader(PaperTrader)` — overrides only `execute_buy`/`execute_sell` with real CLOB orders. `OrderArgs.size` is in **shares** (compute `shares = usdc / price`). Runs a heartbeat thread every 5s — Polymarket cancels all open orders if no heartbeat within 10s.
-- `LiveObserver(Observer)` — wires the above together. Overrides `_get_prices()` (WebSocket-first, REST fallback — returns 3-tuple `(up_prices, down_prices, source)`), `_on_new_market()` (register tokens + subscribe WebSocket), `_finalize_market()` (cancel open orders before resolving).
-- `setup_keys()` / `build_client()` — one-time credential derivation via `create_or_derive_api_creds()`. Saves `api_key`/`api_secret`/`api_passphrase` to `~/.polypanic/keys.json`.
+**`trader.py`**
+- imports and extends `observer.py`
+- live execution engine (`LiveTrader`)
+- market and user WebSockets
+- reconciliation against Polymarket orders, trades, and positions
+- auth and client bootstrap
 
-## Database Schema
+## Important implementation reality
 
-All data in `polymarket_observer.db` (SQLite), created on first run, shared by both scripts.
+Paper and live do not just share config. They also share substantial logic:
+- entry and exit strategy rules
+- cooldown behavior
+- timing gates
+- hold-through-close logic
+- ROI display in the observer loop
+
+If strategy behavior is changed for live and should also apply to paper, check `observer.py` too.
+
+## Current state
+
+The repo is no longer in the very early “untested mainnet” state. Live trading has been exercised and multiple real bugs were fixed.
+
+Important fixed areas:
+- closed-order terminal handling
+- market-data kill-switch recovery
+- failed submission persistence
+- external/manual sell reconciliation
+- active-window Data API lag protection
+- dust-fill flattening
+- opposite-side post-sell cooldown handling
+- mark-to-market ROI display
+- paper/live alignment on minimum trade-size gating
+- short-lived allowance preflight caching for live latency reduction
+
+## Database reality
+
+Do not rely only on the older simplified schema description. Relevant tables now include:
 
 ```sql
-markets         slug, window_start/end_ts, up/down_token_id, btc_open/close_price, resolution
-price_ticks     per-poll bid/ask/mid for UP+DOWN sides, btc_spot_price, btc_delta_from_open,
-                price_source ('rest'|'ws'), up_spread, down_spread, up_change_10s, down_change_10s
-paper_trades    simulated buy/sell: price, size, reason, pnl, bankroll_after,
-                shares, seconds_remaining, spread_at_trade, signal_json
-live_trades     real orders: order_id, requested_price, filled_price (NULL until confirmed), size_usdc, reason
-strategy_config last-used StrategyConfig as JSON (id=1 always)
+markets
+price_ticks
+paper_trades
+live_trades
+strategy_config
+live_orders
+live_fills
+live_positions
+live_market_state
+live_reconciliation_state
 ```
 
-Indexes: `idx_ticks_slug`, `idx_ticks_time`, `idx_ticks_slug_ts` (composite — used by swing analysis), `idx_trades_slug`, `idx_live_trades_slug`.
+For live accounting and debugging, prefer:
+- `live_orders`
+- `live_fills`
+- `live_positions`
 
-## Key API Details
+over `live_trades`.
 
-- **CLOB API:** `https://clob.polymarket.com` — order book, pricing, order placement
-- **Gamma API:** `https://gamma-api.polymarket.com` — market/event discovery
-- **WebSocket:** `wss://ws-subscriptions-clob.polymarket.com/ws/market`
-- **Auth:** `signature_type=0` for EOA wallets. L2 credentials derived from private key via `create_or_derive_api_creds()` (not `create_api_key()`). Keys saved as `api_key`/`api_secret`/`api_passphrase` (not `key`/`secret`/`passphrase`).
-- **Orders:** `OrderArgs.size` is in **shares**, not USDC. Compute `shares = usdc_amount / price`. If price fails tick size validation, round: `round(round(price / tick) * tick, 10)`.
-- **Cancel:** `clob.cancel(order_id)` — plain string, not a dict
-- **Heartbeat (critical):** `clob.post_heartbeat(heartbeat_id)` — first call pass `None`, use returned ID for subsequent calls. Must fire within 10s or Polymarket cancels ALL open orders.
-- **USDC approval** required once before first trade: `client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))`
-- **Fees (from 2026-03-30):** crypto taker 0.072%, maker rebate 20%
+## Strategy notes
 
-**WebSocket subscription message:**
-```json
-{"type": "market", "assets_ids": ["token_id_1", "token_id_2"], "markets": [], "initial_dump": true}
-```
-Send `"PING"` string every ~45s to keep alive. Events received: `event_type: "book"` (full snapshot with `bids`/`asks` arrays of `{"price", "size"}`) and `event_type: "price_change"` (delta with `changes: [{"side": "BUY"|"SELL", "price", "size"}]` — size=0 means level removed).
+Current practical live baseline:
+- entry `0.38`
+- exit `0.54`
+- min entry `0.18`
+- entry delay `20`
+- max entry age `240`
+- cooldown `10`
+- `allow_contrarian`
+- `both_sides`
+- hold threshold `15`
+- hold neutral range `5`
 
-## Architectural Decisions
+Paper analysis so far suggests time of day matters. Business-hour paper performance has looked materially better than overnight, while force exits remain the biggest drag.
 
-- **Two files over one** — `observer.py` stays auth-free and self-contained. `trader.py` imports from it.
-- **Optimistic fills** — local position state updated immediately on order placement; `filled_price` stays NULL until confirmed. Acceptable for v1.
-- **GTC for all orders** — both entries and exits. `force_exit` uses `price * 0.95` to improve fill odds near window close.
-- **REST fallback** — WebSocket is primary; REST polls only when WebSocket data is >5s stale. The `poll_interval_secs` config only kicks in during WebSocket unavailability.
-- **context= param on execute_buy/execute_sell** — market signal snapshot (spread, BTC delta, seconds remaining, etc.) passed explicitly as a dict, not via instance variables.
+## Things not to regress
 
-## Strategy
+- Do not revert dust-fill handling.
+- Do not revert active-window Data API protections.
+- Do not revert failed-order persistence to `failed`.
+- Do not revert mark-to-market ROI display.
+- Do not let paper/live strategy logic drift again.
+- Do not remove entry-rejection logging.
 
-Buy UP or DOWN when ask ≤ entry_threshold AND ask ≥ min_entry_price. Sell when bid ≥ exit_threshold. Never hold through resolution (unless hold_through_close_btc_threshold is set and BTC has moved strongly in your favor). Both sides can be held simultaneously. The edge is retail sentiment overshoot — the market reprices based on crowd psychology, often when BTC has barely moved.
+## Still worth validating
 
-Exit reasons logged in DB: `exit_target` (good), `stop_loss`, `force_exit` (approaching close), `resolution` (held to end — usually bad).
+- more clean daytime live sessions
+- more real settlement-through-resolution cases
+- broader user WebSocket payload coverage
+- further latency trimming on the network-bound order path if needed
 
-## What Still Needs Doing
-
-See `HANDOFF.md` for full context. Key gaps:
-1. Live trading not yet tested against mainnet
-2. WebSocket message field names unverified against live feed
-3. Fill confirmation (currently optimistic — `live_trades.filled_price` stays NULL)
-4. USDC balance check on `LiveObserver` startup
+See `HANDOFF.md` and `STATUS.md` for current operational details.

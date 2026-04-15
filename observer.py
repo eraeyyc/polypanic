@@ -132,8 +132,8 @@ class StrategyConfig:
     # sentiment-overshoot thesis.
     min_entry_price: float = 0.15
 
-    # Seconds to block re-entry on a side after selling it.
-    # Prevents the bot from immediately flipping back into the same side
+    # Seconds to block re-entry on the same side after selling it.
+    # Prevents the bot from immediately re-buying the same side
     # right after an exit — a pattern that has historically lost money.
     # 0 = no cooldown (re-entry allowed immediately)
     post_sell_cooldown_secs: int = 10
@@ -231,17 +231,35 @@ class PolymarketClient:
 
         return result if "up_token_id" in result and "down_token_id" in result else None
 
+    @staticmethod
+    def _best_book_price(levels: list, side: str) -> float:
+        prices = []
+        for level in levels or []:
+            try:
+                size = float(level.get("size", 0))
+                price = float(level.get("price", 0))
+            except Exception:
+                continue
+            if size > 0 and price > 0:
+                prices.append(price)
+        if not prices:
+            return 0.0
+        return max(prices) if side == "bid" else min(prices)
+
     def get_price(self, token_id: str) -> Optional[dict]:
         """Return {"best_bid": float, "best_ask": float} for a token."""
         try:
-            buy  = self.session.get(f"{CLOB_API}/price",
-                                    params={"token_id": token_id, "side": "BUY"}, timeout=5)
-            sell = self.session.get(f"{CLOB_API}/price",
-                                    params={"token_id": token_id, "side": "SELL"}, timeout=5)
-            return {
-                "best_bid": float(buy.json().get("price", 0)),
-                "best_ask": float(sell.json().get("price", 0)),
-            }
+            book = self.get_order_book(token_id)
+            if not book:
+                return None
+            best_bid = self._best_book_price(book.get("bids", []), "bid")
+            best_ask = self._best_book_price(book.get("asks", []), "ask")
+            if best_bid > 0 and best_ask > 0 and best_ask < best_bid:
+                logging.warning(
+                    f"Crossed order book for {token_id[:20]}...: bid={best_bid:.4f} ask={best_ask:.4f}"
+                )
+                return None
+            return {"best_bid": best_bid, "best_ask": best_ask}
         except Exception as exc:
             logging.warning(f"Price fetch failed for {token_id[:20]}...: {exc}")
             return None
@@ -839,10 +857,6 @@ class PaperTrader:
             if side == "down" and btc_delta > 0:
                 return False
         other = "down" if side == "up" else "up"
-        if self.config.post_sell_cooldown_secs > 0:
-            other_sell = self._last_sell_time.get(slug, {}).get(other, 0.0)
-            if time.time() - other_sell < self.config.post_sell_cooldown_secs:
-                return False
         if self.config.btc_momentum_threshold > 0:
             if side == "down" and btc_delta > self.config.btc_momentum_threshold:
                 return False
@@ -1092,6 +1106,18 @@ class Observer:
                 btc_now = self.btc.get_btc_price()
 
                 if up_prices and down_prices:
+                    crossed = []
+                    if self._is_crossed_quote(up_prices):
+                        crossed.append("UP")
+                    if self._is_crossed_quote(down_prices):
+                        crossed.append("DOWN")
+                    if crossed:
+                        logging.warning(
+                            f"   ⚠️  Skipping crossed quote from {price_source}: {', '.join(crossed)}"
+                        )
+                        time.sleep(self.config.poll_interval_secs)
+                        continue
+
                     btc_delta  = (btc_now - self._current_btc_open) \
                                  if btc_now and self._current_btc_open else 0.0
                     up_mid     = (up_prices["best_bid"]   + up_prices["best_ask"])   / 2
@@ -1194,26 +1220,63 @@ class Observer:
             total += pos.shares * (up_mid if pos.side == "up" else down_mid)
         return total
 
+    @staticmethod
+    def _is_crossed_quote(prices: dict) -> bool:
+        bid = prices.get("best_bid", 0.0) or 0.0
+        ask = prices.get("best_ask", 0.0) or 0.0
+        return bid > 0 and ask > 0 and ask < bid
+
+    def _market_close_snapshot(self, slug: str) -> tuple[Optional[float], Optional[str], Optional[float]]:
+        row = self.db.conn.execute(
+            "SELECT btc_open_price, window_end_ts FROM markets WHERE slug=?",
+            (slug,),
+        ).fetchone()
+        if not row or row["btc_open_price"] is None:
+            return None, None, None
+
+        tick = self.db.conn.execute("""
+            SELECT btc_spot_price, timestamp
+            FROM price_ticks
+            WHERE slug=? AND btc_spot_price IS NOT NULL AND timestamp <= ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (slug, row["window_end_ts"])).fetchone()
+        if tick and tick["btc_spot_price"] is not None:
+            resolution = "up" if tick["btc_spot_price"] >= row["btc_open_price"] else "down"
+            return tick["btc_spot_price"], resolution, tick["timestamp"]
+
+        btc_close = self.btc.get_btc_price()
+        if btc_close is None:
+            return None, None, None
+        resolution = "up" if btc_close >= row["btc_open_price"] else "down"
+        return btc_close, resolution, None
+
     def _finalize_market(self, slug: str):
         """Resolve any open positions when a window closes."""
         self.db.flush_ticks()  # commit any buffered ticks before closing the window
-        btc_close = self.btc.get_btc_price()
         row = self.db.conn.execute(
-            "SELECT btc_open_price FROM markets WHERE slug=?", (slug,)
+            "SELECT btc_open_price, window_end_ts FROM markets WHERE slug=?", (slug,)
         ).fetchone()
+        btc_close, resolution, close_ts = self._market_close_snapshot(slug)
 
-        if row and row["btc_open_price"] and btc_close:
-            resolution = "up" if btc_close >= row["btc_open_price"] else "down"
+        if row and row["btc_open_price"] and btc_close is not None and resolution:
             self.db.update_market_close(slug, btc_close, resolution)
             if self.trader.get_positions(slug):
                 self.trader.handle_resolution(slug, resolution, time.time())
             window_pnl  = self.trader.bankroll - self._window_start_bankroll
             pnl_str     = _colored(f"{window_pnl:+.2f}", _GREEN if window_pnl >= 0 else _RED)
             arrow       = "▲" if window_pnl >= 0 else "▼"
+            source_note = ""
+            if close_ts is not None:
+                lag = row["window_end_ts"] - close_ts
+                source_note = f" | close from last in-window tick ({lag:.1f}s before expiry)"
+            else:
+                source_note = " | close from spot fallback"
             logging.info(
                 f"   ✅ Resolved: {resolution.upper()} | "
                 f"BTC ${row['btc_open_price']:,.2f} → ${btc_close:,.2f} | "
                 f"Window P&L: {arrow} {pnl_str}  (bankroll ${self.trader.bankroll:.2f})"
+                f"{source_note}"
             )
 
     def _print_summary(self):
