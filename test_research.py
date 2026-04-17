@@ -11,12 +11,18 @@ from paired_research import (
     MarketContext,
     ResearchDatabase,
     ResearchTick,
+    policy_cost_gated_up_bias,
+    policy_cost_gated_up_bias_flat_only,
+    policy_cost_gated_up_bias_momentum,
     simulate_market,
 )
 from wallet_analyzer import (
     SnapshotEquity,
     TradeRow,
     WalletAnalyzer,
+    _group_reconstructions,
+    _estimate_price_sum,
+    _lean_alignment,
     export_reconstructions_csv,
     reconstruct_windows,
 )
@@ -59,6 +65,51 @@ def _build_snapshot_zip(positions_rows, equity_rows):
 
 
 class WalletAnalyzerTests(unittest.TestCase):
+    def test_lean_alignment_labels_with_and_against_btc(self):
+        self.assertEqual(_lean_alignment("Up", 12.0), "Up-with-BTC")
+        self.assertEqual(_lean_alignment("Up", -12.0), "Up-against-BTC")
+        self.assertEqual(_lean_alignment("Down", -12.0), "Down-with-BTC")
+        self.assertEqual(_lean_alignment("Down", 12.0), "Down-against-BTC")
+        self.assertEqual(_lean_alignment("Up", 1.0), "Up-flat")
+
+    def test_estimate_price_sum_matches_nearby_up_and_down_buys(self):
+        rows = [
+            TradeRow(
+                timestamp=100,
+                slug="btc-updown-5m-0",
+                side="BUY",
+                outcome="Up",
+                price=0.287,
+                size=100.0,
+                asset="up",
+                condition_id="cond",
+                transaction_hash="tx1",
+            ),
+            TradeRow(
+                timestamp=102,
+                slug="btc-updown-5m-0",
+                side="BUY",
+                outcome="Down",
+                price=0.725,
+                size=100.0,
+                asset="down",
+                condition_id="cond",
+                transaction_hash="tx2",
+            ),
+            TradeRow(
+                timestamp=150,
+                slug="btc-updown-5m-0",
+                side="BUY",
+                outcome="Up",
+                price=0.400,
+                size=100.0,
+                asset="up",
+                condition_id="cond",
+                transaction_hash="tx3",
+            ),
+        ]
+        self.assertAlmostEqual(_estimate_price_sum(rows), 1.012)
+
     def test_fetch_market_winner_accepts_dict_shape(self):
         analyzer = WalletAnalyzer("0xabc")
         analyzer.session.get = lambda *args, **kwargs: DummyResponse(
@@ -208,8 +259,171 @@ class WalletAnalyzerTests(unittest.TestCase):
         self.assertIn("combined_cost_ratio", text)
         self.assertIn("winner_overweight", text)
 
+    def test_reconstruct_windows_includes_btc_delta_features(self):
+        analyzer = WalletAnalyzer("0xabc")
+        rows = [
+            TradeRow(
+                timestamp=310,
+                slug="btc-updown-5m-300",
+                side="BUY",
+                outcome="Up",
+                price=0.40,
+                size=10.0,
+                asset="up",
+                condition_id="cond",
+                transaction_hash="tx1",
+            ),
+            TradeRow(
+                timestamp=312,
+                slug="btc-updown-5m-300",
+                side="BUY",
+                outcome="Down",
+                price=0.60,
+                size=8.0,
+                asset="down",
+                condition_id="cond",
+                transaction_hash="tx2",
+            ),
+        ]
+
+        class DummyBTCHistory:
+            def price_at(self, ts):
+                return {300: 100.0, 310: 112.0, 312: 114.0}.get(ts, 100.0)
+
+        with patch.object(analyzer, "fetch_market_winner", return_value="Up"):
+            recon = reconstruct_windows(analyzer, rows, limit=1, btc_history=DummyBTCHistory())
+        self.assertEqual(len(recon), 1)
+        self.assertEqual(recon[0].lean_side, "Up")
+        self.assertAlmostEqual(recon[0].btc_open_price, 100.0)
+        self.assertAlmostEqual(recon[0].btc_first_buy_price, 112.0)
+        self.assertAlmostEqual(recon[0].btc_delta_first_buy, 12.0)
+        self.assertEqual(recon[0].lean_btc_alignment, "Up-with-BTC")
+
+    def test_group_reconstructions_supports_cost_by_lean(self):
+        analyzer = WalletAnalyzer("0xabc")
+        rows = [
+            TradeRow(
+                timestamp=310,
+                slug="btc-updown-5m-300",
+                side="BUY",
+                outcome="Up",
+                price=0.40,
+                size=10.0,
+                asset="up",
+                condition_id="cond",
+                transaction_hash="tx1",
+            ),
+            TradeRow(
+                timestamp=312,
+                slug="btc-updown-5m-300",
+                side="BUY",
+                outcome="Down",
+                price=0.30,
+                size=5.0,
+                asset="down",
+                condition_id="cond",
+                transaction_hash="tx2",
+            ),
+        ]
+
+        class DummyBTCHistory:
+            def price_at(self, ts):
+                return {300: 100.0, 310: 110.0}.get(ts, 100.0)
+
+        with patch.object(analyzer, "fetch_market_winner", return_value="Up"):
+            recon = reconstruct_windows(analyzer, rows, limit=1, btc_history=DummyBTCHistory())
+        groups = _group_reconstructions(recon, "cost_x_lean")
+        self.assertIn("<0.80 | Up", groups)
+
 
 class PairedResearchSimulationTests(unittest.TestCase):
+    def test_cost_gated_up_bias_accepts_projected_ratio_in_band(self):
+        pos = type("P", (), {"up_shares": 0.0, "down_shares": 0.0, "up_spend": 0.0, "down_spend": 0.0, "combined_spend": 0.0})()
+        tick = ResearchTick(
+            timestamp=10.0,
+            seconds_remaining=290.0,
+            up_bid=0.39,
+            up_ask=0.40,
+            down_bid=0.59,
+            down_ask=0.60,
+            btc_spot=100.0,
+            btc_delta=0.0,
+        )
+        spends = policy_cost_gated_up_bias(
+            pos,
+            tick,
+            {"min_cost_ratio": 0.70, "max_cost_ratio": 0.89, "target_cost_ratio": 0.80, "up_notional": 30.0},
+        )
+        self.assertGreater(spends["up"], 0.0)
+        self.assertGreater(spends["down"], 0.0)
+
+    def test_cost_gated_up_bias_rejects_projected_ratio_out_of_band(self):
+        pos = type("P", (), {"up_shares": 0.0, "down_shares": 0.0, "up_spend": 0.0, "down_spend": 0.0, "combined_spend": 0.0})()
+        tick = ResearchTick(
+            timestamp=10.0,
+            seconds_remaining=290.0,
+            up_bid=0.39,
+            up_ask=0.40,
+            down_bid=0.59,
+            down_ask=0.60,
+            btc_spot=100.0,
+            btc_delta=0.0,
+        )
+        spends = policy_cost_gated_up_bias(
+            pos,
+            tick,
+            {
+                "min_cost_ratio": 0.70,
+                "max_cost_ratio": 0.75,
+                "target_cost_ratio": 0.72,
+                "up_notional": 30.0,
+                "min_down_notional": 2.0,
+                "max_down_notional": 8.0,
+            },
+        )
+        self.assertEqual(spends, {"up": 0.0, "down": 0.0})
+
+    def test_cost_gated_up_bias_flat_only_skips_non_flat_btc(self):
+        pos = type("P", (), {"up_shares": 0.0, "down_shares": 0.0, "up_spend": 0.0, "down_spend": 0.0, "combined_spend": 0.0})()
+        tick = ResearchTick(
+            timestamp=10.0,
+            seconds_remaining=290.0,
+            up_bid=0.39,
+            up_ask=0.40,
+            down_bid=0.59,
+            down_ask=0.60,
+            btc_spot=120.0,
+            btc_delta=12.0,
+        )
+        spends = policy_cost_gated_up_bias_flat_only(pos, tick, {"flat_btc_abs": 5.0})
+        self.assertEqual(spends, {"up": 0.0, "down": 0.0})
+
+    def test_cost_gated_up_bias_momentum_uses_up_bias_in_positive_btc(self):
+        pos = type("P", (), {"up_shares": 0.0, "down_shares": 0.0, "up_spend": 0.0, "down_spend": 0.0, "combined_spend": 0.0})()
+        tick = ResearchTick(
+            timestamp=10.0,
+            seconds_remaining=290.0,
+            up_bid=0.49,
+            up_ask=0.50,
+            down_bid=0.49,
+            down_ask=0.50,
+            btc_spot=125.0,
+            btc_delta=25.0,
+        )
+        spends = policy_cost_gated_up_bias_momentum(
+            pos,
+            tick,
+            {
+                "min_cost_ratio": 0.70,
+                "max_cost_ratio": 0.95,
+                "target_cost_ratio": 0.80,
+                "positive_btc_threshold": 20.0,
+                "momentum_up_notional": 36.0,
+            },
+        )
+        self.assertEqual(spends["up"], 36.0)
+        self.assertGreater(spends["down"], 0.0)
+
     def test_equal_size_pair_computes_expected_pnl(self):
         ctx = MarketContext(
             slug="btc-updown-5m-1",

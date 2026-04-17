@@ -71,6 +71,13 @@ class SimPosition:
     def payout_if_down(self) -> float:
         return self.down_shares
 
+    @property
+    def combined_cost_ratio(self) -> float:
+        best_payout = max(self.up_shares, self.down_shares)
+        if best_payout <= 0:
+            return 0.0
+        return self.combined_spend / best_payout
+
 
 class ResearchDatabase:
     def __init__(self, db_path: str = DEFAULT_DB):
@@ -303,17 +310,34 @@ class ResearchCollector:
             return None
         return None
 
-    def run(self, duration_hours: float = 24.0, poll_interval: float = 3.0):
+    def run(
+        self,
+        duration_hours: float = 24.0,
+        poll_interval: float = 3.0,
+        status_interval: float = 30.0,
+    ):
         start = time.time()
         current_slug = None
         current_tokens = None
         btc_open = None
+        tick_count = 0
+        market_tick_count = 0
+        last_status_at = 0.0
+        last_tick: Optional[ResearchTick] = None
         while time.time() - start < duration_hours * 3600:
             window_start, window_end, slug = self.poly.compute_window_times()
             if slug != current_slug:
+                if current_slug and market_tick_count:
+                    logging.info(
+                        "Completed market %s | %d ticks collected",
+                        current_slug,
+                        market_tick_count,
+                    )
                 event = self.poly.get_market_by_slug(slug)
                 tokens = self.poly.extract_token_ids(event) if event else None
                 btc_open = self.btc.get_btc_price()
+                market_tick_count = 0
+                last_tick = None
                 if tokens:
                     self.db.upsert_market(
                         {
@@ -329,7 +353,7 @@ class ResearchCollector:
                             "resolution": None,
                         }
                     )
-                    logging.info(f"Tracking research market {slug}")
+                    logging.info("Tracking research market %s", slug)
                 current_slug = slug
                 current_tokens = tokens
 
@@ -339,20 +363,37 @@ class ResearchCollector:
                 down = self.poly.get_price(current_tokens["down_token_id"])
                 btc_now = self.btc.get_btc_price()
                 if up and down and btc_now:
-                    self.db.insert_tick(
-                        current_slug,
-                        ResearchTick(
-                            timestamp=now,
-                            seconds_remaining=max(0.0, window_end - now),
-                            up_bid=up["best_bid"],
-                            up_ask=up["best_ask"],
-                            down_bid=down["best_bid"],
-                            down_ask=down["best_ask"],
-                            btc_spot=btc_now,
-                            btc_delta=(btc_now - btc_open) if btc_open else 0.0,
-                            price_source="rest",
-                        ),
+                    tick = ResearchTick(
+                        timestamp=now,
+                        seconds_remaining=max(0.0, window_end - now),
+                        up_bid=up["best_bid"],
+                        up_ask=up["best_ask"],
+                        down_bid=down["best_bid"],
+                        down_ask=down["best_ask"],
+                        btc_spot=btc_now,
+                        btc_delta=(btc_now - btc_open) if btc_open else 0.0,
+                        price_source="rest",
                     )
+                    self.db.insert_tick(current_slug, tick)
+                    tick_count += 1
+                    market_tick_count += 1
+                    last_tick = tick
+                    if status_interval > 0 and (now - last_status_at) >= status_interval:
+                        logging.info(
+                            "Collecting %s | ticks=%d market_ticks=%d | %.1fs left | "
+                            "UP %.2f/%.2f DN %.2f/%.2f | BTC $%.2f (%+.2f)",
+                            current_slug,
+                            tick_count,
+                            market_tick_count,
+                            tick.seconds_remaining,
+                            tick.up_bid,
+                            tick.up_ask,
+                            tick.down_bid,
+                            tick.down_ask,
+                            tick.btc_spot,
+                            tick.btc_delta,
+                        )
+                        last_status_at = now
 
             # resolve any expired market that hasn't been finalized yet
             for market in self.db.conn.execute(
@@ -379,8 +420,18 @@ class ResearchCollector:
                             "resolution": winner,
                         }
                     )
-                    logging.info(f"Resolved {market['slug']} -> {winner}")
+                    logging.info("Resolved %s -> %s", market["slug"], winner)
             time.sleep(poll_interval)
+        if current_slug and market_tick_count:
+            if last_tick is not None:
+                logging.info(
+                    "Collector stopped on %s | %d ticks in current market | %.1fs left on last tick",
+                    current_slug,
+                    market_tick_count,
+                    last_tick.seconds_remaining,
+                )
+            else:
+                logging.info("Collector stopped on %s | %d ticks in current market", current_slug, market_tick_count)
 
 
 def _mark_buy(pos: SimPosition, side: str, spend: float, ask: float, seconds_remaining: float):
@@ -402,6 +453,63 @@ def _apply_slippage(ask: float, slippage_bps: float) -> float:
     if ask <= 0:
         return ask
     return ask * (1.0 + (slippage_bps / 10000.0))
+
+
+def _projected_cost_ratio(
+    pos: SimPosition,
+    *,
+    add_up_spend: float,
+    add_down_spend: float,
+    up_ask: float,
+    down_ask: float,
+) -> float:
+    up_shares = pos.up_shares + ((add_up_spend / up_ask) if up_ask > 0 and add_up_spend > 0 else 0.0)
+    down_shares = pos.down_shares + ((add_down_spend / down_ask) if down_ask > 0 and add_down_spend > 0 else 0.0)
+    combined_spend = pos.combined_spend + add_up_spend + add_down_spend
+    best_payout = max(up_shares, down_shares)
+    if best_payout <= 0:
+        return 0.0
+    return combined_spend / best_payout
+
+
+def _within_ratio_band(ratio: float, min_ratio: float, max_ratio: float) -> bool:
+    if ratio <= 0:
+        return False
+    return min_ratio <= ratio <= max_ratio
+
+
+def _pick_up_bias_spends(
+    pos: SimPosition,
+    tick: ResearchTick,
+    *,
+    up_spend: float,
+    min_ratio: float,
+    max_ratio: float,
+    target_ratio: float,
+    min_down_spend: float,
+    max_down_spend: float,
+) -> dict[str, float]:
+    if tick.up_ask <= 0 or tick.down_ask <= 0 or up_spend <= 0:
+        return {"up": 0.0, "down": 0.0}
+    best: Optional[tuple[float, float]] = None
+    for step in range(13):
+        frac = step / 12.0
+        down_spend = min_down_spend + ((max_down_spend - min_down_spend) * frac)
+        projected = _projected_cost_ratio(
+            pos,
+            add_up_spend=up_spend,
+            add_down_spend=down_spend,
+            up_ask=tick.up_ask,
+            down_ask=tick.down_ask,
+        )
+        if not _within_ratio_band(projected, min_ratio, max_ratio):
+            continue
+        distance = abs(projected - target_ratio)
+        if best is None or distance < best[0]:
+            best = (distance, down_spend)
+    if best is None:
+        return {"up": 0.0, "down": 0.0}
+    return {"up": up_spend, "down": round(best[1], 6)}
 
 
 def policy_equal_time(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
@@ -454,12 +562,80 @@ def policy_hedge_conviction(pos: SimPosition, tick: ResearchTick, config: dict) 
     return {"up": 0.0, "down": 0.0}
 
 
+def policy_cost_gated_up_bias(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    min_ratio = float(config.get("min_cost_ratio", 0.70))
+    max_ratio = float(config.get("max_cost_ratio", 0.89))
+    target_ratio = float(config.get("target_cost_ratio", 0.80))
+    up_spend = float(config.get("up_notional", 30.0))
+    min_down_spend = float(config.get("min_down_notional", 10.0))
+    max_down_spend = float(config.get("max_down_notional", 30.0))
+    return _pick_up_bias_spends(
+        pos,
+        tick,
+        up_spend=up_spend,
+        min_ratio=min_ratio,
+        max_ratio=max_ratio,
+        target_ratio=target_ratio,
+        min_down_spend=min_down_spend,
+        max_down_spend=max_down_spend,
+    )
+
+
+def policy_cost_gated_up_bias_flat_only(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    flat_abs = float(config.get("flat_btc_abs", 5.0))
+    if abs(tick.btc_delta) > flat_abs:
+        return {"up": 0.0, "down": 0.0}
+    return policy_cost_gated_up_bias(pos, tick, config)
+
+
+def policy_cost_gated_up_bias_momentum(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    min_ratio = float(config.get("min_cost_ratio", 0.70))
+    max_ratio = float(config.get("max_cost_ratio", 0.89))
+    target_ratio = float(config.get("target_cost_ratio", 0.80))
+    flat_abs = float(config.get("flat_btc_abs", 5.0))
+    positive_btc = float(config.get("positive_btc_threshold", 20.0))
+    flat_up_spend = float(config.get("flat_up_notional", 24.0))
+    flat_min_down_spend = float(config.get("flat_min_down_notional", 12.0))
+    flat_max_down_spend = float(config.get("flat_max_down_notional", 24.0))
+    momentum_up_spend = float(config.get("momentum_up_notional", 36.0))
+    momentum_min_down_spend = float(config.get("momentum_min_down_notional", 12.0))
+    momentum_max_down_spend = float(config.get("momentum_max_down_notional", 28.0))
+
+    if tick.up_ask <= 0 or tick.down_ask <= 0:
+        return {"up": 0.0, "down": 0.0}
+
+    if tick.btc_delta >= positive_btc:
+        up_spend = momentum_up_spend
+        min_down_spend = momentum_min_down_spend
+        max_down_spend = momentum_max_down_spend
+    elif abs(tick.btc_delta) <= flat_abs:
+        up_spend = flat_up_spend
+        min_down_spend = flat_min_down_spend
+        max_down_spend = flat_max_down_spend
+    else:
+        return {"up": 0.0, "down": 0.0}
+
+    return _pick_up_bias_spends(
+        pos,
+        tick,
+        up_spend=up_spend,
+        min_ratio=min_ratio,
+        max_ratio=max_ratio,
+        target_ratio=target_ratio,
+        min_down_spend=min_down_spend,
+        max_down_spend=max_down_spend,
+    )
+
+
 POLICIES: dict[str, Callable[[SimPosition, ResearchTick, dict], dict[str, float]]] = {
     "equal_time": policy_equal_time,
     "combined_cost_threshold": policy_combined_cost_threshold,
     "payout_balanced": policy_payout_balanced,
     "winner_lean_btc": policy_winner_lean_btc,
     "hedge_plus_conviction": policy_hedge_conviction,
+    "cost_gated_up_bias": policy_cost_gated_up_bias,
+    "cost_gated_up_bias_flat_only": policy_cost_gated_up_bias_flat_only,
+    "cost_gated_up_bias_momentum": policy_cost_gated_up_bias_momentum,
 }
 
 
@@ -616,6 +792,7 @@ def main() -> int:
     parser.add_argument("--collect", action="store_true", help="Collect a fresh BTC 5m research dataset")
     parser.add_argument("--duration-hours", type=float, default=24.0, help="Collector run duration")
     parser.add_argument("--poll-interval", type=float, default=3.0, help="Collector poll interval in seconds")
+    parser.add_argument("--status-interval", type=float, default=30.0, help="Collector heartbeat interval in seconds")
     parser.add_argument("--simulate-paired", action="store_true", help="Run paired policy simulation on the research DB")
     parser.add_argument("--policy", choices=["all"] + sorted(POLICIES.keys()), default="equal_time")
     parser.add_argument("--policy-config", default="", help="JSON string or path for policy configuration")
@@ -627,7 +804,11 @@ def main() -> int:
     try:
         if args.collect:
             collector = ResearchCollector(db)
-            collector.run(duration_hours=args.duration_hours, poll_interval=args.poll_interval)
+            collector.run(
+                duration_hours=args.duration_hours,
+                poll_interval=args.poll_interval,
+                status_interval=args.status_interval,
+            )
         if args.simulate_paired:
             config = _load_policy_config(args.policy_config)
             if args.policy == "all":
