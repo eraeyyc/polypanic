@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC 5-Min Live Trader
+Legacy Polymarket BTC 5-Min Live Trader
 
-Extends the observer with real CLOB order execution and a WebSocket price
-feed for sub-second latency. Run observer.py first to collect data and
-validate the strategy in paper mode before using this.
+Extends the legacy one-sided observer strategy with real CLOB order
+execution and a WebSocket price feed for sub-second latency.
+
+This file remains important as exchange-integration and accounting
+infrastructure, but the strategy itself is no longer the primary research
+direction. The current main path is paired hold-to-resolution research in
+`paired_research.py`, with `wallet_analyzer.py` used to reconstruct public
+wallet behavior.
 
 Setup (one-time):
     pip install py-clob-client websockets

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Polymarket BTC 5-Minute Market Observer & Paper Trader
+Legacy Polymarket BTC 5-Minute Observer & Paper Trader
 
 Watches every 5-minute BTC up/down market on Polymarket, logs the full
 price lifecycle of both sides, correlates with actual BTC spot price,
-and runs a configurable paper trading strategy.
+and runs the original one-sided paper trading strategy.
 
-The core thesis: Polymarket's 5-min BTC markets are driven by retail
-sentiment that overshoots in both directions. Buy a side when it's cheap
-(<entry_threshold), sell when the market overreacts (>exit_threshold),
-and never hold through resolution.
+This entrypoint is now legacy/reference infrastructure. The main research
+path has shifted toward paired hold-to-resolution analysis in
+`paired_research.py` and wallet reconstruction in `wallet_analyzer.py`.
+Keep this runnable for comparison and historical analysis, but do not
+treat it as the primary strategy direction.
 
 Usage:
     python observer.py                  # Run live observation + paper trading
