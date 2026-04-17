@@ -1,36 +1,47 @@
 # Status
 
-**Last updated:** 2026-04-15
+**Last updated:** 2026-04-16
 
-## Current live run command
+## Primary strategy status
 
-Use `./run.sh` and a fresh DB:
+The old one-sided entry/exit strategy is now legacy. The repo’s main path is:
+
+1. public wallet reconstruction via `wallet_analyzer.py`
+2. fresh paired BTC 5-minute dataset collection via `paired_research.py`
+3. paired hold-to-resolution simulation before any new live deployment
+
+## Current primary commands
+
+Analyze the benchmark wallet:
 
 ```bash
-cd /Users/MAC/projects/polypanic
+python3 wallet_analyzer.py 0xe0229e10a858860218b6132f4234602c47bd6603 --reconstruct 50 --summary-by winner
+```
 
-export POLYMARKET_PRIVATE_KEY=0x...
-export POLYMARKET_SIGNATURE_TYPE=1
-export POLYMARKET_FUNDER=0x...
+Collect a fresh research dataset:
 
-./run.sh trader.py \
-  --entry 0.38 \
-  --exit 0.54 \
-  --entry-delay 20 \
-  --max-entry-age 240 \
-  --min-entry 0.18 \
-  --cooldown 10 \
-  --max-position 3 \
-  --min-position 1 \
-  --bankroll 10 \
-  --max-total-exposure 10 \
-  --max-open-orders 2 \
-  --allow-contrarian \
-  --both-sides \
-  --hold-threshold 15 \
-  --hold-neutral-range 5 \
-  --db polymarket_live10.db \
-  --log-level INFO
+```bash
+./run.sh paired_research.py --collect --db paired_research.db --duration-hours 24 --poll-interval 3
+```
+
+Simulate one paired policy:
+
+```bash
+./run.sh paired_research.py \
+  --simulate-paired \
+  --db paired_research.db \
+  --policy payout_balanced \
+  --policy-config '{"combined_threshold":1.01,"notional_step":20,"fee_bps":7.2,"slippage_bps":10}'
+```
+
+Rank all built-in paired policies:
+
+```bash
+./run.sh paired_research.py \
+  --simulate-paired \
+  --db paired_research.db \
+  --policy all \
+  --policy-config '{"fee_bps":7.2,"slippage_bps":10}'
 ```
 
 ## What is currently fixed
@@ -56,6 +67,14 @@ export POLYMARKET_FUNDER=0x...
 - paper trader now mirrors live minimum effective trade-size behavior
 - `observer.py --analyze` now prints local-time session and hour-of-day trade timing summaries
 
+### New paired research path
+
+- `wallet_analyzer.py` now reconstructs per-window BTC 5-minute public wallet behavior
+- reconstruction output includes spend, shares, payout profile, gross P&L, ROI, timing, and skew metrics
+- grouped summaries can bucket windows by skew, timing, combined cost, and winner overweight
+- `paired_research.py` now collects a dedicated BTC 5-minute research DB separate from legacy paper DBs
+- paired-policy simulation supports fee and slippage assumptions and can rank built-in policy families
+
 ### Order-path latency
 
 - allowance/balance preflight is now briefly cached in live trading to reduce redundant REST calls during repeated attempts
@@ -63,31 +82,35 @@ export POLYMARKET_FUNDER=0x...
 
 ## Current evidence
 
-### Paper trading
+### Legacy paper trading
 
 `polymarket_observer_100.db` suggests regular business hours are materially better than overnight:
 - overnight bucket: negative overall
 - business-hours bucket: strongly positive overall
 - force exits remain the main drag across all buckets
 
-### Live trading
+### Public wallet reconstruction
 
-Live trading works, but the dataset is still small. Several older DBs were contaminated by bugs that have since been fixed, so do not tune the strategy based on those alone.
+The public benchmark wallet strongly suggests a different strategy shape:
+- buys both `Up` and `Down` in most BTC 5-minute windows
+- often scales in multiple times per window
+- appears to hold through resolution and realize via redemption, not visible sells
+- gross edge seems to come from paired cost structure plus uneven side weighting
 
-Important accounting caveat:
-- sell-side local accounting is now on-chain confirmed
-- buy-side accounting is still phase-1 / observability only, with divergence warnings rather than full tentative/confirmed balance enforcement
+### Legacy live trading
+
+Live trading works at the infrastructure layer, but the old strategy is no longer the main direction. Do not start new live tests until the paired research path clears its evidence bar.
 
 ## What still needs validation
 
-- more clean live sessions with no manual website intervention
-- more daytime live sessions to compare against the earlier overnight tests
-- more resolution / settlement cases in real live trading
-- more unusual user WebSocket payloads and partial-fill edge cases
+- at least one clean 24–48h paired research dataset
+- simulation results that stay positive after fee/slippage assumptions
+- explainable weighting rules, not just one-off wallet mimicry
+- confirmation that the paired edge is not concentrated in a few outlier windows
 
 ## Practical guidance
 
-- Use a fresh DB per live session.
-- Do not manually trade the same market while the bot is running.
-- Keep config stable across a batch of test sessions so results are comparable.
-- If the bot does something strange, inspect the session DB first before changing thresholds.
+- Treat `observer.py` / `trader.py` as legacy/reference.
+- Use a fresh `paired_research.db` or clearly versioned research DBs.
+- Keep collector settings stable for the full 24–48h dataset.
+- Do not start new live tests until the paired simulation path looks durable after costs.

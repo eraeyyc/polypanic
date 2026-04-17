@@ -152,10 +152,10 @@ class ResearchDatabase:
             (:slug, :window_start_ts, :window_end_ts, :market_id, :condition_id,
              :up_token_id, :down_token_id, :btc_open_price, :btc_close_price, :resolution)
             ON CONFLICT(slug) DO UPDATE SET
-                market_id=excluded.market_id,
-                condition_id=excluded.condition_id,
-                up_token_id=excluded.up_token_id,
-                down_token_id=excluded.down_token_id,
+                market_id=COALESCE(NULLIF(excluded.market_id, ''), research_markets.market_id),
+                condition_id=COALESCE(NULLIF(excluded.condition_id, ''), research_markets.condition_id),
+                up_token_id=COALESCE(NULLIF(excluded.up_token_id, ''), research_markets.up_token_id),
+                down_token_id=COALESCE(NULLIF(excluded.down_token_id, ''), research_markets.down_token_id),
                 btc_open_price=COALESCE(research_markets.btc_open_price, excluded.btc_open_price),
                 btc_close_price=COALESCE(excluded.btc_close_price, research_markets.btc_close_price),
                 resolution=COALESCE(excluded.resolution, research_markets.resolution)
@@ -246,6 +246,13 @@ class ResearchDatabase:
             """,
             row,
         )
+        self.conn.commit()
+
+    def delete_sim_results(self, policy: Optional[str] = None):
+        if policy:
+            self.conn.execute("DELETE FROM research_sim_results WHERE policy=?", (policy,))
+        else:
+            self.conn.execute("DELETE FROM research_sim_results")
         self.conn.commit()
 
     def summarize_sim_policy(self, policy: str) -> Optional[sqlite3.Row]:
@@ -391,6 +398,12 @@ def _mark_buy(pos: SimPosition, side: str, spend: float, ask: float, seconds_rem
     pos.last_buy_s = entry_s if pos.last_buy_s is None else max(pos.last_buy_s, entry_s)
 
 
+def _apply_slippage(ask: float, slippage_bps: float) -> float:
+    if ask <= 0:
+        return ask
+    return ask * (1.0 + (slippage_bps / 10000.0))
+
+
 def policy_equal_time(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
     if tick.up_ask <= 0 or tick.down_ask <= 0:
         return {"up": 0.0, "down": 0.0}
@@ -466,6 +479,7 @@ def simulate_market(ctx: MarketContext, policy_name: str, config: dict) -> dict:
     start_after = float(config.get("start_after_secs", 0.0))
     stop_after = float(config.get("stop_after_secs", 300.0))
     fee_bps = float(config.get("fee_bps", 0.0))
+    slippage_bps = float(config.get("slippage_bps", 0.0))
     last_exec_ts = None
 
     for tick in ctx.ticks:
@@ -476,9 +490,21 @@ def simulate_market(ctx: MarketContext, policy_name: str, config: dict) -> dict:
             continue
         spends = policy(pos, tick, config)
         if spends.get("up", 0.0) > 0:
-            _mark_buy(pos, "up", spends["up"], tick.up_ask, tick.seconds_remaining)
+            _mark_buy(
+                pos,
+                "up",
+                spends["up"],
+                _apply_slippage(tick.up_ask, slippage_bps),
+                tick.seconds_remaining,
+            )
         if spends.get("down", 0.0) > 0:
-            _mark_buy(pos, "down", spends["down"], tick.down_ask, tick.seconds_remaining)
+            _mark_buy(
+                pos,
+                "down",
+                spends["down"],
+                _apply_slippage(tick.down_ask, slippage_bps),
+                tick.seconds_remaining,
+            )
         if spends.get("up", 0.0) > 0 or spends.get("down", 0.0) > 0:
             last_exec_ts = tick.timestamp
 
@@ -513,6 +539,8 @@ def simulate_market(ctx: MarketContext, policy_name: str, config: dict) -> dict:
                 "gross_pnl_if_down": round(gross_pnl_if_down, 6),
                 "combined_cost_ratio": round(combined_spend / max(pos.up_shares, pos.down_shares), 6)
                 if max(pos.up_shares, pos.down_shares) > 0 else 0.0,
+                "fee_bps": fee_bps,
+                "slippage_bps": slippage_bps,
                 "config": config,
             },
             sort_keys=True,
@@ -520,8 +548,27 @@ def simulate_market(ctx: MarketContext, policy_name: str, config: dict) -> dict:
     }
 
 
+def _print_policy_ranking(rows: list[dict]):
+    if not rows:
+        return
+    print("Policy ranking:")
+    ranked = sorted(
+        rows,
+        key=lambda row: (row["total_net"], row["avg_net"], row["worst_net"]),
+        reverse=True,
+    )
+    for row in ranked:
+        print(
+            f"  {row['policy']:22s} windows={row['n']:4d} "
+            f"gross=${row['total_gross']:+.2f} net=${row['total_net']:+.2f} "
+            f"avg_net=${row['avg_net']:+.2f} avg_roi={row['avg_roi']*100:.2f}% "
+            f"worst=${row['worst_net']:+.2f}"
+        )
+
+
 def run_simulation(db: ResearchDatabase, policy_name: str, config: dict):
     assert policy_name in POLICIES, f"unknown policy {policy_name}"
+    db.delete_sim_results(policy_name)
     rows = []
     for market in db.list_simulatable_markets():
         ctx = db.load_market_context(market["slug"])
@@ -542,6 +589,25 @@ def run_simulation(db: ResearchDatabase, policy_name: str, config: dict):
     print(f"  Avg net/window:  ${statistics.mean(net_values):+.2f}")
     print(f"  Median net/win:  ${statistics.median(net_values):+.2f}")
     print(f"  Worst net win:   ${min(net_values):+.2f}")
+    return {
+        "policy": policy_name,
+        "n": len(rows),
+        "total_gross": sum(gross_values),
+        "total_net": sum(net_values),
+        "avg_net": statistics.mean(net_values),
+        "avg_roi": statistics.mean(row["roi"] for row in rows),
+        "worst_net": min(net_values),
+    }
+
+
+def run_simulation_suite(db: ResearchDatabase, config: dict):
+    summaries = []
+    for policy_name in sorted(POLICIES):
+        summary = run_simulation(db, policy_name, config)
+        if summary:
+            summaries.append(summary)
+    print()
+    _print_policy_ranking(summaries)
 
 
 def main() -> int:
@@ -551,7 +617,7 @@ def main() -> int:
     parser.add_argument("--duration-hours", type=float, default=24.0, help="Collector run duration")
     parser.add_argument("--poll-interval", type=float, default=3.0, help="Collector poll interval in seconds")
     parser.add_argument("--simulate-paired", action="store_true", help="Run paired policy simulation on the research DB")
-    parser.add_argument("--policy", choices=sorted(POLICIES.keys()), default="equal_time")
+    parser.add_argument("--policy", choices=["all"] + sorted(POLICIES.keys()), default="equal_time")
     parser.add_argument("--policy-config", default="", help="JSON string or path for policy configuration")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -564,7 +630,10 @@ def main() -> int:
             collector.run(duration_hours=args.duration_hours, poll_interval=args.poll_interval)
         if args.simulate_paired:
             config = _load_policy_config(args.policy_config)
-            run_simulation(db, args.policy, config)
+            if args.policy == "all":
+                run_simulation_suite(db, config)
+            else:
+                run_simulation(db, args.policy, config)
     finally:
         db.close()
     return 0

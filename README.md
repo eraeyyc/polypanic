@@ -1,42 +1,75 @@
-# Polymarket BTC 5-Min Observer and Live Trader
+# Polymarket BTC 5-Min Research Repo
 
-This repo tracks Polymarket BTC 5-minute up/down markets, records the full price path, runs a paper strategy, and contains a live-trading layer that is now structurally safer but still needs runtime validation against the real exchange.
+This repo now has two distinct paths:
 
-## Current paper baseline
+- `observer.py` / `trader.py`: the legacy one-sided strategy and live execution stack
+- `wallet_analyzer.py` / `paired_research.py`: the current paired hold-to-resolution research path
 
-The paper-tested baseline is the filtered strategy:
+The main direction is no longer tuning the old one-sided exit-target strategy. The repo is now oriented around:
 
-- entry `<= 0.38`
-- exit `>= 0.70`
-- `entry_delay=60`
-- `max_entry_age=150`
-- `min_entry=0.15`
-- single-side by default
-- BTC-aligned entries by default
+1. reconstructing successful public BTC 5-minute wallets,
+2. collecting a clean paired-strategy research dataset,
+3. simulating paired buy-both-side policies before any new live trading.
 
-Run it with a fresh DB:
+## Current primary workflow
+
+### 1. Analyze a benchmark wallet
 
 ```bash
-./run.sh observer.py \
-  --entry 0.38 \
-  --exit 0.70 \
-  --entry-delay 60 \
-  --max-entry-age 150 \
-  --min-entry 0.15 \
-  --db polymarket_observer_v2.db
+python3 wallet_analyzer.py 0xe0229e10a858860218b6132f4234602c47bd6603 --reconstruct 50 --summary-by winner
 ```
 
-Analyze that DB separately:
+Useful options:
+
+- `--reconstruct N`
+- `--from-slugs file.txt`
+- `--summary-by skew|timing|combined_cost|winner`
+- `--export-csv out.csv`
+
+### 2. Collect a fresh paired-strategy dataset
 
 ```bash
-./run.sh observer.py --analyze --db polymarket_observer_v2.db
+./run.sh paired_research.py \
+  --collect \
+  --db paired_research.db \
+  --duration-hours 24 \
+  --poll-interval 3
+```
+
+This creates a dedicated research DB with:
+
+- BTC 5-minute market metadata
+- timestamped best bid/ask for both sides
+- BTC spot and BTC delta from window open
+- final market resolution
+
+### 3. Simulate paired policies
+
+Run one policy:
+
+```bash
+./run.sh paired_research.py \
+  --simulate-paired \
+  --db paired_research.db \
+  --policy payout_balanced \
+  --policy-config '{"combined_threshold":1.01,"notional_step":20,"fee_bps":7.2,"slippage_bps":10}'
+```
+
+Compare all built-in policies:
+
+```bash
+./run.sh paired_research.py \
+  --simulate-paired \
+  --db paired_research.db \
+  --policy all \
+  --policy-config '{"fee_bps":7.2,"slippage_bps":10}'
 ```
 
 ## Repository structure
 
 ### `observer.py`
 
-Paper trading and data collection.
+Legacy paper trading and market data collection.
 
 - market discovery
 - BTC spot tracking
@@ -46,7 +79,7 @@ Paper trading and data collection.
 
 ### `trader.py`
 
-Live trading layer built on top of the observer foundation.
+Legacy live trading layer built on top of the observer foundation.
 
 Current live implementation includes:
 
@@ -68,9 +101,21 @@ Notes:
 - settlement uses the actual `winning_asset_id` from the WebSocket, not the paper BTC proxy logic
 - smoke test confirmed: fills, fee tracking, and realized P&L working correctly
 
-### `test_live_trader.py`
+### `wallet_analyzer.py`
 
-Local unit tests for the new live-trader support code.
+Canonical wallet-research tool for public BTC 5-minute accounts.
+
+It reconstructs per-window spend, shares, payout profiles, and rough hold-to-resolution P&L from Polymarket public APIs and accounting snapshots.
+
+### `paired_research.py`
+
+Dedicated paired hold-to-resolution research collector and simulator.
+
+This is the new main path for strategy work.
+
+### `test_live_trader.py` / `test_research.py`
+
+Local regression tests for legacy live-trader logic and the new research pipeline.
 
 ## Database
 
@@ -104,13 +149,23 @@ If you use `./run.sh`, it will activate the repo `.venv` automatically.
 
 ## Safe local checks
 
-Before testing anything live:
+Before trusting any code changes:
 
 ```bash
 cd /Users/MAC/projects/polypanic
-python3 -m py_compile observer.py trader.py test_live_trader.py
-python3 -m unittest test_live_trader.py
+python3 -m py_compile observer.py trader.py wallet_analyzer.py paired_research.py test_live_trader.py test_research.py
+python3 -m unittest test_live_trader.py test_research.py
 ```
+
+## Legacy strategy status
+
+The old one-sided paper/live strategy is retained for reference, debugging, and historical comparison only.
+
+Do not treat it as the primary system to improve. The current evidence bar before any new live testing is:
+
+- wallet reconstruction
+- fresh paired research dataset
+- paired-policy simulation results that remain positive after fee/slippage assumptions
 
 ## Live setup
 
@@ -148,9 +203,9 @@ client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLL
 client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id="..."))
 ```
 
-## Live test commands
+## Legacy live test commands
 
-Do not start with normal size. Start with the smallest sensible notional.
+These remain available for reference and infrastructure validation only.
 
 Example tiny smoke test:
 
