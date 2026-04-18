@@ -174,13 +174,14 @@ class StrategyConfig:
 class PolymarketClient:
     """Read-only Polymarket API client — market discovery and price polling."""
 
-    def __init__(self):
+    def __init__(self, host: str = CLOB_API):
+        self.host = host.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "PolymarketObserver/1.0"})
 
     def get_server_time(self) -> float:
         try:
-            resp = self.session.get(f"{CLOB_API}/time", timeout=5)
+            resp = self.session.get(f"{self.host}/time", timeout=5)
             resp.raise_for_status()
             return float(resp.text)
         except Exception:
@@ -267,7 +268,7 @@ class PolymarketClient:
 
     def get_order_book(self, token_id: str) -> Optional[dict]:
         try:
-            resp = self.session.get(f"{CLOB_API}/book",
+            resp = self.session.get(f"{self.host}/book",
                                     params={"token_id": token_id}, timeout=5)
             resp.raise_for_status()
             return resp.json()
@@ -1022,11 +1023,12 @@ class Observer:
 
     def __init__(self, config: StrategyConfig,
                  db_path: str = "polymarket_observer.db",
-                 trader=None):
+                 trader=None,
+                 poly_host: str = CLOB_API):
         self.config  = config
         self.db      = Database(db_path)
         self.db.save_config(config)
-        self.poly    = PolymarketClient()
+        self.poly    = PolymarketClient(poly_host)
         self.btc     = BTCPriceClient()
         self.trader  = trader if trader is not None else PaperTrader(config, self.db)
         self.running = True

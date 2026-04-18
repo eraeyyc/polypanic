@@ -19,6 +19,8 @@ class DummyClob:
         self.fail_post_order = False
         self.balance_allowance_calls = 0
         self.builder = None
+        self.open_orders = []
+        self.trades = []
 
     def get_order_book(self, token_id):
         class _Book:
@@ -26,8 +28,13 @@ class DummyClob:
             min_order_size = "1"
         return _Book()
 
-    def get_fee_rate_bps(self, token_id):
-        return 72
+    def get_clob_market_info(self, condition_id):
+        return {
+            "mts": "0.01",
+            "mos": "1",
+            "fd": {"r": 0.072, "e": 1, "to": True},
+            "t": [{"t": "token-up", "o": "Up"}, {"t": "token-down", "o": "Down"}],
+        }
 
     def calculate_market_price(self, token_id, side, amount, order_type):
         return 0.38
@@ -43,6 +50,18 @@ class DummyClob:
         if self.fail_post_order:
             raise RuntimeError("boom")
         return {"orderID": "oid-live", "status": "submitted"}
+
+    def get_open_orders(self, params):
+        return list(self.open_orders)
+
+    def get_trades(self, params):
+        return list(self.trades)
+
+    def cancel_order(self, payload):
+        return {"canceled": [payload.orderID]}
+
+    def cancel_market_orders(self, payload):
+        return {"canceled": payload.market}
 
     def get_address(self):
         return "0xdeadbeef"
@@ -170,20 +189,16 @@ class LiveAccountingTests(unittest.TestCase):
         trader.balance_api = DummyBalanceClient()
         return trader
 
-    def test_fee_calculation_for_buy_and_sell(self):
+    def test_fill_fee_extraction_prefers_event_payload(self):
         trader = self._build_trader()
-        buy_fee_amount, buy_fee_asset, buy_fee_shares = trader._compute_fee(
-            shares=100.0, price=0.40, action="buy", fee_rate_bps=72
+        fee_amount, fee_asset = trader._extract_fee_from_event(
+            {"fee_amount": "0.1512", "fee_asset": "usdc"}
         )
-        sell_fee_amount, sell_fee_asset, sell_fee_shares = trader._compute_fee(
-            shares=100.0, price=0.70, action="sell", fee_rate_bps=72
-        )
-        self.assertAlmostEqual(buy_fee_amount, 0.1728)
-        self.assertEqual(buy_fee_asset, "SHARES")
-        self.assertAlmostEqual(buy_fee_shares, 0.432)
-        self.assertAlmostEqual(sell_fee_amount, 0.1512)
-        self.assertEqual(sell_fee_asset, "USDC")
-        self.assertEqual(sell_fee_shares, 0.0)
+        self.assertAlmostEqual(fee_amount, 0.1512)
+        self.assertEqual(fee_asset, "USDC")
+        fee_amount, fee_asset = trader._extract_fee_from_event({})
+        self.assertEqual(fee_amount, 0.0)
+        self.assertEqual(fee_asset, "USDC")
         trader.db.close()
 
     def test_fill_application_updates_position_and_realized_pnl(self):
@@ -351,6 +366,46 @@ class LiveStateHandlingTests(unittest.TestCase):
         with patch("trader._now_ts", return_value=101.0):
             self.assertTrue(trader._check_allowance("token-1", "buy", expected_shares=10.0, expected_notional=3.8))
         self.assertEqual(trader.clob.balance_allowance_calls, 1)
+        trader.db.close()
+
+    def test_startup_readiness_requires_usable_pusd_balance(self):
+        trader = self._build_trader()
+
+        def low_balance(_params):
+            return {"balance": "0.5", "allowance": "1000"}
+
+        trader.clob.get_balance_allowance = low_balance
+        with self.assertRaisesRegex(RuntimeError, "Insufficient pUSD collateral"):
+            trader.validate_startup_readiness()
+        trader.db.close()
+
+    def test_startup_readiness_closes_local_orders_missing_from_exchange(self):
+        trader = self._build_trader()
+        order = LiveOrderState(
+            client_order_id="cid-live",
+            order_id="oid-live",
+            slug="btc-updown-5m-9999999999",
+            market_id="cond-1",
+            token_id="token-1",
+            side="up",
+            intent="buy",
+            order_type="market",
+            tif="FAK",
+            requested_price=0.38,
+            requested_shares=10.0,
+            requested_notional=3.8,
+            fee_rate_bps=0,
+            created_at=1.0,
+            status="submitted",
+        )
+        trader.open_orders[order.order_id] = order
+        trader.db.upsert_live_order(order.to_record())
+        trader.clob.open_orders = []
+
+        trader.validate_startup_readiness()
+
+        row = trader.db.get_live_order("oid-live")
+        self.assertEqual(row["status"], "closed")
         trader.db.close()
 
     def test_onchain_balance_uses_funder_address_when_present(self):

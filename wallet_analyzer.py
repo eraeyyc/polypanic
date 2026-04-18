@@ -30,6 +30,7 @@ import requests
 DATA_API = "https://data-api.polymarket.com"
 BTC_5M_PREFIX = "btc-updown-5m-"
 COINBASE_CANDLES_API = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+LOCAL_TZ = datetime.now().astimezone().tzinfo or UTC
 
 
 @dataclass
@@ -77,10 +78,55 @@ class SnapshotEquity:
 
 
 @dataclass
+class TradeBurst:
+    slug: str
+    side: str
+    outcome: str
+    start_ts: int
+    end_ts: int
+    total_size: float
+    total_spend: float
+    fills: int
+
+    @property
+    def avg_price(self) -> float:
+        if self.total_size <= 0:
+            return 0.0
+        return self.total_spend / self.total_size
+
+    @property
+    def window_start_ts(self) -> int:
+        try:
+            return int(self.slug.rsplit("-", 1)[-1])
+        except Exception:
+            return 0
+
+    @property
+    def start_seconds_into_window(self) -> Optional[int]:
+        start = self.window_start_ts
+        if start <= 0:
+            return None
+        return self.start_ts - start
+
+
+@dataclass
 class WindowReconstruction:
     slug: str
     winner: str
     lean_side: str
+    local_hour_bucket: str
+    first_burst_outcome: str
+    first_burst_s: Optional[int]
+    initial_favored_side: str
+    final_favored_side: str
+    favored_flip_count: int
+    prev_winner: str
+    prev_winner_streak: int
+    streak_alignment: str
+    burst_count: int
+    early_bursts: int
+    mid_bursts: int
+    late_bursts: int
     up_shares: float
     up_spend: float
     down_shares: float
@@ -106,6 +152,35 @@ class WindowReconstruction:
     btc_delta_first_buy: float
     btc_delta_last_buy: float
     lean_btc_alignment: str
+
+
+@dataclass
+class BurstEvolutionStep:
+    idx: int
+    burst: TradeBurst
+    cumulative_up_shares: float
+    cumulative_down_shares: float
+    cumulative_spend: float
+    pnl_if_up: float
+    pnl_if_down: float
+    combined_cost_ratio: float
+    delta_pnl_if_up: float
+    delta_pnl_if_down: float
+    delta_cost_ratio: float
+    effect: str
+    favored_side: str
+    favored_changed: bool
+
+
+@dataclass
+class FormulaFitResult:
+    name: str
+    choices: int
+    correct: int
+    up_predictions: int
+    down_predictions: int
+    up_actual_correct: int
+    down_actual_correct: int
 
 
 class BTCHistoryClient:
@@ -306,7 +381,178 @@ def pct(n: int, d: int) -> float:
     return (100.0 * n / d) if d else 0.0
 
 
-def summarize_rows(label: str, rows: list[TradeRow]) -> str:
+def cluster_trade_bursts(rows: list[TradeRow], *, gap_secs: int = 5) -> list[TradeBurst]:
+    bursts: list[TradeBurst] = []
+    by_key: dict[tuple[str, str, str], list[TradeRow]] = collections.defaultdict(list)
+    for row in rows:
+        by_key[(row.slug, row.side, row.outcome)].append(row)
+
+    for (slug, side, outcome), group in by_key.items():
+        ordered = sorted(group, key=lambda row: (row.timestamp, row.transaction_hash))
+        current: Optional[TradeBurst] = None
+        for row in ordered:
+            if current is None or row.timestamp - current.end_ts > gap_secs:
+                current = TradeBurst(
+                    slug=slug,
+                    side=side,
+                    outcome=outcome,
+                    start_ts=row.timestamp,
+                    end_ts=row.timestamp,
+                    total_size=row.size,
+                    total_spend=row.size * row.price,
+                    fills=1,
+                )
+                bursts.append(current)
+                continue
+            current.end_ts = row.timestamp
+            current.total_size += row.size
+            current.total_spend += row.size * row.price
+            current.fills += 1
+    bursts.sort(key=lambda burst: (burst.slug, burst.start_ts, burst.outcome, burst.side))
+    return bursts
+
+
+def _classify_burst_effect(delta_pnl_if_up: float, delta_pnl_if_down: float, delta_cost_ratio: float) -> str:
+    eps = 1e-9
+    if delta_pnl_if_up < -eps and delta_pnl_if_down < -eps:
+        return "damage"
+    if delta_pnl_if_up > eps and delta_pnl_if_down < -eps:
+        return "favor_up"
+    if delta_pnl_if_down > eps and delta_pnl_if_up < -eps:
+        return "favor_down"
+    if delta_pnl_if_up > eps and delta_pnl_if_down > eps:
+        return "repair"
+    if delta_cost_ratio < -eps and (delta_pnl_if_up > eps or delta_pnl_if_down > eps):
+        return "repair"
+    return "mixed"
+
+
+def build_burst_evolution(
+    rows: list[TradeRow],
+    slug: str,
+    *,
+    gap_secs: int = 5,
+) -> list[BurstEvolutionStep]:
+    window_rows = [row for row in rows if row.slug == slug and row.side == "BUY"]
+    bursts = [burst for burst in cluster_trade_bursts(window_rows, gap_secs=gap_secs) if burst.side == "BUY"]
+    bursts.sort(key=lambda burst: (burst.start_ts, burst.outcome))
+
+    steps: list[BurstEvolutionStep] = []
+    up_shares = 0.0
+    down_shares = 0.0
+    spend = 0.0
+    prev_pnl_if_up = 0.0
+    prev_pnl_if_down = 0.0
+    prev_ratio = 0.0
+    prev_favored_side = "Flat"
+    for idx, burst in enumerate(bursts, start=1):
+        spend += burst.total_spend
+        if burst.outcome == "Up":
+            up_shares += burst.total_size
+        elif burst.outcome == "Down":
+            down_shares += burst.total_size
+        best_payout = max(up_shares, down_shares)
+        ratio = (spend / best_payout) if best_payout > 0 else 0.0
+        pnl_if_up = up_shares - spend
+        pnl_if_down = down_shares - spend
+        delta_pnl_if_up = pnl_if_up - prev_pnl_if_up
+        delta_pnl_if_down = pnl_if_down - prev_pnl_if_down
+        delta_cost_ratio = ratio - prev_ratio
+        favored_side = _favored_side_from_pnl(pnl_if_up, pnl_if_down)
+        favored_changed = (
+            favored_side != "Flat"
+            and prev_favored_side != "Flat"
+            and favored_side != prev_favored_side
+        )
+        steps.append(
+            BurstEvolutionStep(
+                idx=idx,
+                burst=burst,
+                cumulative_up_shares=up_shares,
+                cumulative_down_shares=down_shares,
+                cumulative_spend=spend,
+                pnl_if_up=pnl_if_up,
+                pnl_if_down=pnl_if_down,
+                combined_cost_ratio=ratio,
+                delta_pnl_if_up=delta_pnl_if_up,
+                delta_pnl_if_down=delta_pnl_if_down,
+                delta_cost_ratio=delta_cost_ratio,
+                effect=_classify_burst_effect(delta_pnl_if_up, delta_pnl_if_down, delta_cost_ratio),
+                favored_side=favored_side,
+                favored_changed=favored_changed,
+            )
+        )
+        prev_pnl_if_up = pnl_if_up
+        prev_pnl_if_down = pnl_if_down
+        prev_ratio = ratio
+        if favored_side != "Flat":
+            prev_favored_side = favored_side
+    return steps
+
+
+def summarize_burst_evolution(
+    rows: list[TradeRow],
+    slug: str,
+    *,
+    winner: Optional[str] = None,
+    gap_secs: int = 5,
+) -> str:
+    steps = build_burst_evolution(rows, slug, gap_secs=gap_secs)
+    lines = [f"Burst evolution for {slug}"]
+    if winner in {"Up", "Down"}:
+        lines[0] += f" | winner={winner}"
+    if not steps:
+        lines.append("  No BUY bursts found")
+        return "\n".join(lines)
+
+    lines.append(f"  BUY bursts: {len(steps)} (gap <= {gap_secs}s)")
+    final = steps[-1]
+    effect_counts = collections.Counter(step.effect for step in steps)
+    favored_flip_count = sum(1 for step in steps if step.favored_changed)
+    initial_favored = next((step.favored_side for step in steps if step.favored_side != "Flat"), "Flat")
+    lines.append(
+        f"  Final geometry: spend=${final.cumulative_spend:,.2f} "
+        f"| up_shares={final.cumulative_up_shares:,.1f} "
+        f"| down_shares={final.cumulative_down_shares:,.1f} "
+        f"| pnl_if_up=${final.pnl_if_up:,.2f} "
+        f"| pnl_if_down=${final.pnl_if_down:,.2f} "
+        f"| cost_ratio={final.combined_cost_ratio:.3f}"
+    )
+    lines.append(
+        f"  Favored side: initial={initial_favored} final={final.favored_side} flips={favored_flip_count}"
+    )
+    lines.append(
+        "  Burst effects: "
+        + ", ".join(f"{name}={count}" for name, count in sorted(effect_counts.items()))
+    )
+    lines.append("  Steps:")
+    for step in steps:
+        sec = step.burst.start_seconds_into_window
+        sec_label = f"{sec:>3}s" if sec is not None else " ?s"
+        realized = ""
+        if winner == "Up":
+            realized = f" | realized=${step.pnl_if_up:,.2f}"
+        elif winner == "Down":
+            realized = f" | realized=${step.pnl_if_down:,.2f}"
+        lines.append(
+            f"    {step.idx:02d}. {sec_label} {step.burst.outcome} "
+            f"@${step.burst.avg_price:.3f} x{step.burst.fills} "
+            f"({step.burst.total_size:,.1f}sh / ${step.burst.total_spend:,.2f}) "
+            f"-> spend=${step.cumulative_spend:,.2f} "
+            f"| pnl_if_up=${step.pnl_if_up:,.2f} "
+            f"| pnl_if_down=${step.pnl_if_down:,.2f} "
+            f"| d_up=${step.delta_pnl_if_up:,.2f} "
+            f"| d_down=${step.delta_pnl_if_down:,.2f} "
+            f"| d_cost={step.delta_cost_ratio:+.3f} "
+            f"| cost={step.combined_cost_ratio:.3f} "
+            f"| favored={step.favored_side}"
+            f"{' *flip*' if step.favored_changed else ''} "
+            f"| {step.effect}{realized}"
+        )
+    return "\n".join(lines)
+
+
+def summarize_rows(label: str, rows: list[TradeRow], *, burst_gap_secs: int = 5) -> str:
     lines: list[str] = []
     lines.append(f"{label}: {len(rows)} BTC 5m trade rows")
     if not rows:
@@ -315,8 +561,12 @@ def summarize_rows(label: str, rows: list[TradeRow]) -> str:
     by_slug: dict[str, list[TradeRow]] = collections.defaultdict(list)
     side_counts = collections.Counter(r.side for r in rows)
     outcome_counts = collections.Counter(r.outcome for r in rows)
+    bursts = cluster_trade_bursts(rows, gap_secs=burst_gap_secs)
+    bursts_by_slug: dict[str, list[TradeBurst]] = collections.defaultdict(list)
     for row in rows:
         by_slug[row.slug].append(row)
+    for burst in bursts:
+        bursts_by_slug[burst.slug].append(burst)
 
     both_outcomes = 0
     buy_only_windows = 0
@@ -325,13 +575,19 @@ def summarize_rows(label: str, rows: list[TradeRow]) -> str:
     sec_values: list[int] = []
     price_values: list[float] = []
     size_values: list[float] = []
-    window_shapes = collections.Counter()
+    buy_burst_counts: list[int] = []
+    side_burst_counts: list[int] = []
+    one_buy_burst_per_side = 0
+    early_burst_counts: list[int] = []
+    mid_burst_counts: list[int] = []
+    late_burst_counts: list[int] = []
 
     for slug, vals in by_slug.items():
         outcomes = {v.outcome for v in vals if v.outcome}
-        sides = {v.side for v in vals if v.side}
         buys = [v for v in vals if v.side == "BUY"]
         sells = [v for v in vals if v.side == "SELL"]
+        window_bursts = bursts_by_slug.get(slug, [])
+        buy_bursts = [b for b in window_bursts if b.side == "BUY"]
         if len(outcomes) > 1:
             both_outcomes += 1
         if buys and not sells:
@@ -340,8 +596,15 @@ def summarize_rows(label: str, rows: list[TradeRow]) -> str:
             sell_windows += 1
         if len(buys) >= 3:
             scale_windows += 1
-        if buys:
-            window_shapes["both_outcomes" if len({b.outcome for b in buys}) > 1 else "one_outcome"] += 1
+        if buy_bursts:
+            buy_burst_counts.append(len(buy_bursts))
+            side_counts_in_window = collections.Counter(b.outcome for b in buy_bursts)
+            side_burst_counts.extend(side_counts_in_window.values())
+            if side_counts_in_window.get("Up", 0) == 1 and side_counts_in_window.get("Down", 0) == 1:
+                one_buy_burst_per_side += 1
+            early_burst_counts.append(sum(1 for b in buy_bursts if (b.start_seconds_into_window or 0) < 100))
+            mid_burst_counts.append(sum(1 for b in buy_bursts if 100 <= (b.start_seconds_into_window or 0) < 200))
+            late_burst_counts.append(sum(1 for b in buy_bursts if (b.start_seconds_into_window or 0) >= 200))
         for v in vals:
             if v.seconds_into_window is not None:
                 sec_values.append(v.seconds_into_window)
@@ -367,6 +630,27 @@ def summarize_rows(label: str, rows: list[TradeRow]) -> str:
         f"Windows with buys but no visible sells: {buy_only_windows}/{len(by_slug)} "
         f"({pct(buy_only_windows, len(by_slug)):.1f}%)"
     )
+    lines.append(f"BUY bursts (gap <= {burst_gap_secs}s): {len([b for b in bursts if b.side == 'BUY'])} total")
+    if buy_burst_counts:
+        lines.append(
+            f"Buy bursts/window: median {median_or_zero(list(map(float, buy_burst_counts))):.1f} "
+            f"(min {min(buy_burst_counts)}, max {max(buy_burst_counts)})"
+        )
+    if side_burst_counts:
+        lines.append(
+            f"Buy bursts per side/window: median {median_or_zero(list(map(float, side_burst_counts))):.1f} "
+            f"(min {min(side_burst_counts)}, max {max(side_burst_counts)})"
+        )
+    if buy_burst_counts:
+        lines.append(
+            f"Burst timing/window: early median {median_or_zero(list(map(float, early_burst_counts))):.1f}, "
+            f"mid median {median_or_zero(list(map(float, mid_burst_counts))):.1f}, "
+            f"late median {median_or_zero(list(map(float, late_burst_counts))):.1f}"
+        )
+    lines.append(
+        f"Windows with exactly one BUY burst per side: {one_buy_burst_per_side}/{len(by_slug)} "
+        f"({pct(one_buy_burst_per_side, len(by_slug)):.1f}%)"
+    )
     if sec_values:
         lines.append(
             f"Entry timing: median {median_or_zero(list(map(float, sec_values))):.1f}s into window "
@@ -390,7 +674,14 @@ def summarize_rows(label: str, rows: list[TradeRow]) -> str:
             for v in vals[:8]
             if v.seconds_into_window is not None
         )
+        burst_preview = ", ".join(
+            f"{(b.start_seconds_into_window if b.start_seconds_into_window is not None else -1):>3}s "
+            f"{b.side} {b.outcome} @{b.avg_price:.3f} x{b.fills}"
+            for b in bursts_by_slug.get(slug, [])[:6]
+        )
         lines.append(f"  {slug}: {preview}")
+        if burst_preview:
+            lines.append(f"    bursts: {burst_preview}")
     return "\n".join(lines)
 
 
@@ -507,6 +798,14 @@ def _lean_side(up_shares: float, down_shares: float) -> str:
     return "Flat"
 
 
+def _favored_side_from_pnl(pnl_if_up: float, pnl_if_down: float) -> str:
+    if pnl_if_up > pnl_if_down:
+        return "Up"
+    if pnl_if_down > pnl_if_up:
+        return "Down"
+    return "Flat"
+
+
 def _lean_alignment(lean_side: str, btc_delta: float) -> str:
     if abs(btc_delta) < 5:
         return f"{lean_side}-flat"
@@ -515,6 +814,203 @@ def _lean_alignment(lean_side: str, btc_delta: float) -> str:
     if lean_side == "Down":
         return "Down-with-BTC" if btc_delta < 0 else "Down-against-BTC"
     return "Flat"
+
+
+def _local_hour_bucket(ts: int) -> str:
+    if ts <= 0:
+        return "unknown"
+    return datetime.fromtimestamp(ts, UTC).astimezone(LOCAL_TZ).strftime("%H:00")
+
+
+def _streak_alignment(initial_favored_side: str, prev_winner: str) -> str:
+    if prev_winner not in {"Up", "Down"} or initial_favored_side not in {"Up", "Down"}:
+        return "no-prev"
+    if initial_favored_side == prev_winner:
+        return "with-prev-streak"
+    return "against-prev-streak"
+
+
+def _bucket_prev_streak(length: int) -> str:
+    if length <= 0:
+        return "no-prev"
+    if length == 1:
+        return "prev-1"
+    if length == 2:
+        return "prev-2"
+    return "prev-3+"
+
+
+def _clamp_price(price: float) -> float:
+    return min(0.99, max(0.01, price))
+
+
+def _post_burst_state(
+    up_shares: float,
+    down_shares: float,
+    spend: float,
+    *,
+    outcome: str,
+    burst_spend: float,
+    burst_price: float,
+) -> tuple[float, float, float]:
+    burst_price = _clamp_price(burst_price)
+    shares = burst_spend / burst_price if burst_price > 0 else 0.0
+    spend += burst_spend
+    if outcome == "Up":
+        up_shares += shares
+    else:
+        down_shares += shares
+    return up_shares, down_shares, spend
+
+
+def _formula_metrics(up_shares: float, down_shares: float, spend: float) -> tuple[float, float, float, float]:
+    pnl_if_up = up_shares - spend
+    pnl_if_down = down_shares - spend
+    best_payout = max(up_shares, down_shares, 1.0)
+    cost_ratio = spend / best_payout if best_payout > 0 else 0.0
+    return pnl_if_up, pnl_if_down, best_payout, cost_ratio
+
+
+def _score_linear_bounded(up_shares: float, down_shares: float, spend: float) -> float:
+    pnl_if_up, pnl_if_down, _, _ = _formula_metrics(up_shares, down_shares, spend)
+    favored = max(pnl_if_up, pnl_if_down)
+    other = min(pnl_if_up, pnl_if_down)
+    return favored - 0.75 * max(0.0, -other)
+
+
+def _score_quadratic_downside(up_shares: float, down_shares: float, spend: float) -> float:
+    pnl_if_up, pnl_if_down, best_payout, _ = _formula_metrics(up_shares, down_shares, spend)
+    favored = max(pnl_if_up, pnl_if_down)
+    other = min(pnl_if_up, pnl_if_down)
+    downside = max(0.0, -other)
+    return favored - (downside * downside / best_payout)
+
+
+def _score_quadratic_cost(up_shares: float, down_shares: float, spend: float) -> float:
+    pnl_if_up, pnl_if_down, best_payout, cost_ratio = _formula_metrics(up_shares, down_shares, spend)
+    favored = max(pnl_if_up, pnl_if_down)
+    other = min(pnl_if_up, pnl_if_down)
+    cost_penalty = 6.0 * best_payout * max(0.0, cost_ratio - 0.85) ** 2
+    return favored - 0.5 * max(0.0, -other) - cost_penalty
+
+
+def _score_target_geometry(up_shares: float, down_shares: float, spend: float) -> float:
+    pnl_if_up, pnl_if_down, best_payout, cost_ratio = _formula_metrics(up_shares, down_shares, spend)
+    favored = max(pnl_if_up, pnl_if_down)
+    other = min(pnl_if_up, pnl_if_down)
+    cost_penalty = 4.0 * best_payout * max(0.0, cost_ratio - 0.85) ** 2
+    return -abs(favored - 75.0) - 0.5 * abs(other + 75.0) - cost_penalty
+
+
+FORMULA_SCORERS = {
+    "linear_bounded": _score_linear_bounded,
+    "quadratic_downside": _score_quadratic_downside,
+    "quadratic_cost": _score_quadratic_cost,
+    "target_geometry": _score_target_geometry,
+}
+
+
+def evaluate_formula_fits(
+    rows: list[TradeRow],
+    *,
+    limit_windows: int = 50,
+    slug_filter: Optional[set[str]] = None,
+    gap_secs: int = 5,
+) -> list[FormulaFitResult]:
+    by_slug: dict[str, list[TradeRow]] = collections.defaultdict(list)
+    for row in rows:
+        if row.side != "BUY":
+            continue
+        if slug_filter and row.slug not in slug_filter:
+            continue
+        by_slug[row.slug].append(row)
+    ordered = sorted(by_slug.items(), key=lambda kv: max(r.timestamp for r in kv[1]), reverse=True)[:limit_windows]
+    formula_hits = {
+        name: {
+            "choices": 0,
+            "correct": 0,
+            "up_predictions": 0,
+            "down_predictions": 0,
+            "up_actual_correct": 0,
+            "down_actual_correct": 0,
+        }
+        for name in FORMULA_SCORERS
+    }
+    for slug, vals in ordered:
+        bursts = [burst for burst in cluster_trade_bursts(vals, gap_secs=gap_secs) if burst.side == "BUY"]
+        bursts.sort(key=lambda burst: (burst.start_ts, burst.outcome))
+        up_shares = 0.0
+        down_shares = 0.0
+        spend = 0.0
+        for burst in bursts:
+            alt_price = _clamp_price(1.0 - burst.avg_price)
+            actual_up, actual_down, actual_spend = _post_burst_state(
+                up_shares,
+                down_shares,
+                spend,
+                outcome=burst.outcome,
+                burst_spend=burst.total_spend,
+                burst_price=burst.avg_price,
+            )
+            cf_up = _post_burst_state(
+                up_shares,
+                down_shares,
+                spend,
+                outcome="Up",
+                burst_spend=burst.total_spend,
+                burst_price=burst.avg_price if burst.outcome == "Up" else alt_price,
+            )
+            cf_down = _post_burst_state(
+                up_shares,
+                down_shares,
+                spend,
+                outcome="Down",
+                burst_spend=burst.total_spend,
+                burst_price=burst.avg_price if burst.outcome == "Down" else alt_price,
+            )
+            for name, scorer in FORMULA_SCORERS.items():
+                up_score = scorer(*cf_up)
+                down_score = scorer(*cf_down)
+                predicted = "Up" if up_score >= down_score else "Down"
+                rec = formula_hits[name]
+                rec["choices"] += 1
+                rec["up_predictions"] += 1 if predicted == "Up" else 0
+                rec["down_predictions"] += 1 if predicted == "Down" else 0
+                if predicted == burst.outcome:
+                    rec["correct"] += 1
+                    if burst.outcome == "Up":
+                        rec["up_actual_correct"] += 1
+                    else:
+                        rec["down_actual_correct"] += 1
+            up_shares, down_shares, spend = actual_up, actual_down, actual_spend
+    return [
+        FormulaFitResult(
+            name=name,
+            choices=stats["choices"],
+            correct=stats["correct"],
+            up_predictions=stats["up_predictions"],
+            down_predictions=stats["down_predictions"],
+            up_actual_correct=stats["up_actual_correct"],
+            down_actual_correct=stats["down_actual_correct"],
+        )
+        for name, stats in formula_hits.items()
+    ]
+
+
+def summarize_formula_fits(results: list[FormulaFitResult]) -> str:
+    lines = ["Formula fit (approximate counterfactuals via complementary price):"]
+    if not results:
+        lines.append("  No bursts available")
+        return "\n".join(lines)
+    for result in sorted(results, key=lambda row: (row.correct / row.choices) if row.choices else 0.0, reverse=True):
+        accuracy = pct(result.correct, result.choices)
+        lines.append(
+            f"  {result.name:18s} accuracy={accuracy:.1f}% "
+            f"({result.correct}/{result.choices}) "
+            f"| preds Up/Down={result.up_predictions}/{result.down_predictions} "
+            f"| correct Up/Down={result.up_actual_correct}/{result.down_actual_correct}"
+        )
+    return "\n".join(lines)
 
 
 def reconstruct_windows(
@@ -569,11 +1065,32 @@ def reconstruct_windows(
         btc_last_buy_price = btc_history.price_at(last_buy_ts) if btc_history else 0.0
         btc_delta_first_buy = (btc_first_buy_price - btc_open_price) if btc_open_price and btc_first_buy_price else 0.0
         btc_delta_last_buy = (btc_last_buy_price - btc_open_price) if btc_open_price and btc_last_buy_price else 0.0
+        evolution = build_burst_evolution(vals, slug)
+        initial_favored_side = next((step.favored_side for step in evolution if step.favored_side != "Flat"), "Flat")
+        final_favored_side = evolution[-1].favored_side if evolution else "Flat"
+        favored_flip_count = sum(1 for step in evolution if step.favored_changed)
+        first_burst = evolution[0].burst if evolution else None
+        early_bursts = sum(1 for step in evolution if (step.burst.start_seconds_into_window or 0) < 100)
+        mid_bursts = sum(1 for step in evolution if 100 <= (step.burst.start_seconds_into_window or 0) < 200)
+        late_bursts = sum(1 for step in evolution if (step.burst.start_seconds_into_window or 0) >= 200)
         recon.append(
             WindowReconstruction(
                 slug=slug,
                 winner=winner,
                 lean_side=lean_side,
+                local_hour_bucket=_local_hour_bucket(window_start_ts),
+                first_burst_outcome=first_burst.outcome if first_burst else "Flat",
+                first_burst_s=first_burst.start_seconds_into_window if first_burst else None,
+                initial_favored_side=initial_favored_side,
+                final_favored_side=final_favored_side,
+                favored_flip_count=favored_flip_count,
+                prev_winner="None",
+                prev_winner_streak=0,
+                streak_alignment="no-prev",
+                burst_count=len(evolution),
+                early_bursts=early_bursts,
+                mid_bursts=mid_bursts,
+                late_bursts=late_bursts,
                 up_shares=up_shares,
                 up_spend=up_spend,
                 down_shares=down_shares,
@@ -603,6 +1120,19 @@ def reconstruct_windows(
         )
         if len(recon) >= limit:
             break
+    chron = sorted(recon, key=lambda row: int(row.slug.rsplit("-", 1)[-1]))
+    for idx, row in enumerate(chron):
+        if idx == 0:
+            continue
+        prev_winner = chron[idx - 1].winner
+        streak_len = 1
+        j = idx - 2
+        while j >= 0 and chron[j].winner == prev_winner:
+            streak_len += 1
+            j -= 1
+        row.prev_winner = prev_winner
+        row.prev_winner_streak = streak_len
+        row.streak_alignment = _streak_alignment(row.initial_favored_side, prev_winner)
     return recon
 
 
@@ -628,6 +1158,31 @@ def summarize_reconstructions(rows: list[WindowReconstruction], summary_by: Opti
     lines.append(
         f"  Winner overweighted: {sum(1 for r in rows if r.winner_overweight)}/{len(rows)} "
         f"({pct(sum(1 for r in rows if r.winner_overweight), len(rows)):.1f}%)"
+    )
+    lines.append(
+        f"  First burst side counts: {dict(collections.Counter(r.first_burst_outcome for r in rows))}"
+    )
+    lines.append(
+        f"  Initial favored side counts: {dict(collections.Counter(r.initial_favored_side for r in rows))}"
+    )
+    lines.append(
+        f"  Final favored side counts: {dict(collections.Counter(r.final_favored_side for r in rows))}"
+    )
+    lines.append(
+        f"  Previous streak alignment: {dict(collections.Counter(r.streak_alignment for r in rows))}"
+    )
+    lines.append(
+        f"  Favored flips/window: median {statistics.median(r.favored_flip_count for r in rows):.1f} "
+        f"(min {min(r.favored_flip_count for r in rows)}, max {max(r.favored_flip_count for r in rows)})"
+    )
+    lines.append(
+        f"  Previous winner streak/window: median {statistics.median(r.prev_winner_streak for r in rows):.1f} "
+        f"(min {min(r.prev_winner_streak for r in rows)}, max {max(r.prev_winner_streak for r in rows)})"
+    )
+    lines.append(
+        f"  Burst timing/window: early median {statistics.median(r.early_bursts for r in rows):.1f}, "
+        f"mid median {statistics.median(r.mid_bursts for r in rows):.1f}, "
+        f"late median {statistics.median(r.late_bursts for r in rows):.1f}"
     )
     cost_ratios = sorted(r.combined_cost_ratio for r in rows)
     price_sums = [r.price_sum for r in rows if r.price_sum > 0]
@@ -680,6 +1235,46 @@ def _group_reconstructions(rows: list[WindowReconstruction], mode: str) -> dict[
     for row in rows:
         if mode == "winner":
             key = f"{row.winner}-overweight" if row.winner_overweight else f"{row.winner}-underweight"
+        elif mode == "first_burst":
+            key = row.first_burst_outcome
+        elif mode == "initial_favored":
+            key = row.initial_favored_side
+        elif mode == "final_favored":
+            key = row.final_favored_side
+        elif mode == "prev_streak":
+            key = _bucket_prev_streak(row.prev_winner_streak)
+        elif mode == "streak_alignment":
+            key = row.streak_alignment
+        elif mode == "time_of_day":
+            key = row.local_hour_bucket
+        elif mode == "cost_x_streak":
+            key = f"{_bucket_combined_cost(row.combined_cost_ratio)} | {row.streak_alignment}"
+        elif mode == "cost_x_time":
+            key = f"{_bucket_combined_cost(row.combined_cost_ratio)} | {row.local_hour_bucket}"
+        elif mode == "cost_x_flip":
+            if row.favored_flip_count == 0:
+                flip_bucket = "no-flip"
+            elif row.favored_flip_count == 1:
+                flip_bucket = "one-flip"
+            else:
+                flip_bucket = "multi-flip"
+            key = f"{_bucket_combined_cost(row.combined_cost_ratio)} | {flip_bucket}"
+        elif mode == "favored_flip":
+            if row.favored_flip_count == 0:
+                key = "no-flip"
+            elif row.favored_flip_count == 1:
+                key = "one-flip"
+            else:
+                key = "multi-flip"
+        elif mode == "burst_phase":
+            if row.late_bursts > row.early_bursts and row.late_bursts > row.mid_bursts:
+                key = "late-heavy"
+            elif row.early_bursts > row.mid_bursts and row.early_bursts > row.late_bursts:
+                key = "early-heavy"
+            elif row.mid_bursts > row.early_bursts and row.mid_bursts > row.late_bursts:
+                key = "mid-heavy"
+            else:
+                key = "balanced"
         elif mode == "timing":
             start = row.first_buy_s or 0
             if start < 60:
@@ -725,7 +1320,10 @@ def _group_reconstructions(rows: list[WindowReconstruction], mode: str) -> dict[
 
 def export_reconstructions_csv(rows: list[WindowReconstruction], path: str):
     fields = [
-        "slug", "winner", "lean_side",
+        "slug", "winner", "lean_side", "local_hour_bucket", "first_burst_outcome", "first_burst_s",
+        "initial_favored_side", "final_favored_side", "favored_flip_count", "prev_winner",
+        "prev_winner_streak", "streak_alignment", "burst_count",
+        "early_bursts", "mid_bursts", "late_bursts",
         "up_shares", "up_spend", "down_shares", "down_spend",
         "combined_spend", "payout_if_up", "payout_if_down",
         "gross_pnl", "roi", "gross_pnl_if_up", "gross_pnl_if_down",
@@ -758,7 +1356,10 @@ def main() -> int:
     parser.add_argument("--max-activity", type=int, default=1000, help="Max /activity rows to fetch")
     parser.add_argument("--reconstruct", type=int, default=0, help="Reconstruct N recent windows with winner/P&L estimates")
     parser.add_argument("--from-slugs", default="", help="Optional file with one slug per line to restrict reconstruction")
-    parser.add_argument("--summary-by", choices=["skew", "timing", "combined_cost", "price_sum", "winner", "btc_delta", "lean_alignment", "lean_side", "cost_x_lean", "cost_x_btc"], default="", help="Grouped summary mode for reconstruction output")
+    parser.add_argument("--burst-window", default="", help="Print burst-by-burst payoff geometry for one slug")
+    parser.add_argument("--burst-gap-secs", type=int, default=5, help="Gap threshold used to cluster fills into bursts")
+    parser.add_argument("--fit-formulas", type=int, default=0, help="Evaluate candidate burst-choice formulas across N recent windows")
+    parser.add_argument("--summary-by", choices=["skew", "timing", "combined_cost", "price_sum", "winner", "btc_delta", "lean_alignment", "lean_side", "cost_x_lean", "cost_x_btc", "cost_x_streak", "cost_x_time", "cost_x_flip", "favored_flip", "first_burst", "initial_favored", "final_favored", "burst_phase", "prev_streak", "streak_alignment", "time_of_day"], default="", help="Grouped summary mode for reconstruction output")
     parser.add_argument("--export-csv", default="", help="Write reconstructed window metrics to CSV")
     parser.add_argument("--json", action="store_true", help="Emit compact JSON summary")
     args = parser.parse_args()
@@ -790,6 +1391,16 @@ def main() -> int:
     print(compare_trade_views(taker_rows, activity_rows))
     print()
     print(summarize_snapshot(snapshot_positions, snapshot_equity, all_rows or activity_rows or taker_rows))
+    if args.burst_window:
+        print()
+        print(
+            summarize_burst_evolution(
+                all_rows,
+                args.burst_window,
+                winner=analyzer.fetch_market_winner(args.burst_window),
+                gap_secs=args.burst_gap_secs,
+            )
+        )
     if args.reconstruct > 0:
         print()
         slug_filter = _load_slug_filter(args.from_slugs) if args.from_slugs else None
@@ -810,6 +1421,19 @@ def main() -> int:
         if args.export_csv:
             export_reconstructions_csv(recon, args.export_csv)
         print(summarize_reconstructions(recon, summary_by=(args.summary_by or None)))
+    if args.fit_formulas > 0:
+        print()
+        slug_filter = _load_slug_filter(args.from_slugs) if args.from_slugs else None
+        print(
+            summarize_formula_fits(
+                evaluate_formula_fits(
+                    all_rows,
+                    limit_windows=args.fit_formulas,
+                    slug_filter=slug_filter,
+                    gap_secs=args.burst_gap_secs,
+                )
+            )
+        )
     return 0
 
 

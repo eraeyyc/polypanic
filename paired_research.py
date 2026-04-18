@@ -79,6 +79,21 @@ class SimPosition:
         return self.combined_spend / best_payout
 
 
+@dataclass
+class MarketQualityCheck:
+    ok: bool
+    reason: Optional[str] = None
+
+
+@dataclass
+class EarlyMomentumObservation:
+    slug: str
+    winner: str
+    checkpoint_s: int
+    elapsed_s: float
+    btc_delta: float
+
+
 class ResearchDatabase:
     def __init__(self, db_path: str = DEFAULT_DB):
         self.db_path = db_path
@@ -455,6 +470,117 @@ def _apply_slippage(ask: float, slippage_bps: float) -> float:
     return ask * (1.0 + (slippage_bps / 10000.0))
 
 
+def assess_market_quality(ctx: MarketContext, config: dict) -> MarketQualityCheck:
+    min_ticks = int(config.get("min_ticks", 50))
+    min_ask_sum = float(config.get("min_ask_sum", 0.80))
+    max_ask_sum = float(config.get("max_ask_sum", 1.20))
+
+    if len(ctx.ticks) < min_ticks:
+        return MarketQualityCheck(False, "low_ticks")
+
+    ask_sums = [
+        tick.up_ask + tick.down_ask
+        for tick in ctx.ticks
+        if tick.up_ask > 0 and tick.down_ask > 0
+    ]
+    if len(ask_sums) < min_ticks:
+        return MarketQualityCheck(False, "insufficient_valid_quotes")
+    if min(ask_sums) < min_ask_sum:
+        return MarketQualityCheck(False, "ask_sum_too_low")
+    if max(ask_sums) > max_ask_sum:
+        return MarketQualityCheck(False, "ask_sum_too_high")
+    return MarketQualityCheck(True)
+
+
+def _winner_for_delta(delta: float, flat_threshold: float = 0.0) -> str:
+    if delta > flat_threshold:
+        return "Up"
+    if delta < -flat_threshold:
+        return "Down"
+    return "Flat"
+
+
+def _extract_early_momentum_observations(
+    ctx: MarketContext,
+    *,
+    checkpoints: list[int],
+    tolerance_secs: float,
+) -> list[EarlyMomentumObservation]:
+    observations: list[EarlyMomentumObservation] = []
+    if not ctx.ticks or not ctx.btc_open:
+        return observations
+    for checkpoint in checkpoints:
+        best_tick: Optional[ResearchTick] = None
+        best_distance: Optional[float] = None
+        for tick in ctx.ticks:
+            elapsed = 300.0 - tick.seconds_remaining
+            distance = abs(elapsed - checkpoint)
+            if best_distance is None or distance < best_distance:
+                best_tick = tick
+                best_distance = distance
+        if best_tick is None or best_distance is None or best_distance > tolerance_secs:
+            continue
+        observations.append(
+            EarlyMomentumObservation(
+                slug=ctx.slug,
+                winner=ctx.winner,
+                checkpoint_s=checkpoint,
+                elapsed_s=300.0 - best_tick.seconds_remaining,
+                btc_delta=best_tick.btc_spot - ctx.btc_open,
+            )
+        )
+    return observations
+
+
+def analyze_early_btc_signal(db: ResearchDatabase, config: dict):
+    checkpoints = [int(v) for v in config.get("checkpoints", [5, 10, 15])]
+    thresholds = [float(v) for v in config.get("thresholds", [0, 5, 10, 20, 30])]
+    tolerance_secs = float(config.get("tolerance_secs", 4.0))
+    observations: list[EarlyMomentumObservation] = []
+    skipped = 0
+    for market in db.list_simulatable_markets():
+        ctx = db.load_market_context(market["slug"])
+        if not ctx or not ctx.ticks:
+            continue
+        obs = _extract_early_momentum_observations(
+            ctx,
+            checkpoints=checkpoints,
+            tolerance_secs=tolerance_secs,
+        )
+        if not obs:
+            skipped += 1
+            continue
+        observations.extend(obs)
+
+    if not observations:
+        print("No early BTC momentum observations available.")
+        return
+
+    print(f"Early BTC momentum signal analysis: {len(observations)} observations across {len({o.slug for o in observations})} windows")
+    if skipped:
+        print(f"  Windows without usable early ticks: {skipped}")
+    for checkpoint in checkpoints:
+        rows = [o for o in observations if o.checkpoint_s == checkpoint]
+        if not rows:
+            continue
+        print(f"Checkpoint +{checkpoint}s:")
+        print(
+            f"  Avg |delta|: ${statistics.mean(abs(o.btc_delta) for o in rows):.2f} "
+            f"| median actual sample time {statistics.median(o.elapsed_s for o in rows):.1f}s"
+        )
+        for threshold in thresholds:
+            usable = [o for o in rows if abs(o.btc_delta) >= threshold]
+            directional = [o for o in usable if _winner_for_delta(o.btc_delta) != 'Flat']
+            if not usable:
+                continue
+            matches = sum(1 for o in directional if _winner_for_delta(o.btc_delta) == o.winner)
+            directional_rate = (100.0 * matches / len(directional)) if directional else 0.0
+            print(
+                f"  |delta| >= ${threshold:.0f}: n={len(usable):3d} "
+                f"directional={len(directional):3d} match={directional_rate:5.1f}%"
+            )
+
+
 def _projected_cost_ratio(
     pos: SimPosition,
     *,
@@ -581,6 +707,17 @@ def policy_cost_gated_up_bias(pos: SimPosition, tick: ResearchTick, config: dict
     )
 
 
+def policy_cost_gated_up_bias_late_guard(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    elapsed = 300.0 - tick.seconds_remaining
+    late_start = float(config.get("late_guard_start_secs", 180.0))
+    up_ask_max = float(config.get("late_guard_up_ask_max", 0.35))
+    down_ask_min = float(config.get("late_guard_down_ask_min", 0.60))
+    if elapsed >= late_start and tick.up_ask > 0 and tick.down_ask > 0:
+        if tick.up_ask <= up_ask_max and tick.down_ask >= down_ask_min:
+            return {"up": 0.0, "down": 0.0}
+    return policy_cost_gated_up_bias(pos, tick, config)
+
+
 def policy_cost_gated_up_bias_flat_only(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
     flat_abs = float(config.get("flat_btc_abs", 5.0))
     if abs(tick.btc_delta) > flat_abs:
@@ -627,6 +764,158 @@ def policy_cost_gated_up_bias_momentum(pos: SimPosition, tick: ResearchTick, con
     )
 
 
+def policy_strength_follow_share_clips(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    if tick.up_ask <= 0 or tick.down_ask <= 0:
+        return {"up": 0.0, "down": 0.0}
+
+    elapsed = 300.0 - tick.seconds_remaining
+    min_start = float(config.get("signal_start_secs", 15.0))
+    strength_gap = float(config.get("strength_gap", 0.08))
+    dominant_clip_shares = float(config.get("dominant_clip_shares", 58.0))
+    hedge_clip_shares = float(config.get("hedge_clip_shares", 20.0))
+    max_projected_ratio = float(config.get("max_projected_cost_ratio", 0.98))
+    late_start = float(config.get("late_reversal_start_secs", 180.0))
+    reversal_gap = float(config.get("late_reversal_gap", 0.18))
+
+    ask_gap = tick.up_ask - tick.down_ask
+
+    if pos.up_shares > pos.down_shares:
+        dominant_side = "up"
+    elif pos.down_shares > pos.up_shares:
+        dominant_side = "down"
+    else:
+        if elapsed < min_start or abs(ask_gap) < strength_gap:
+            return {"up": 0.0, "down": 0.0}
+        dominant_side = "up" if ask_gap > 0 else "down"
+
+    # Stop pressing a side late if the opposite side has clearly taken over.
+    if elapsed >= late_start:
+        if dominant_side == "up" and (tick.down_ask - tick.up_ask) >= reversal_gap:
+            return {"up": 0.0, "down": 0.0}
+        if dominant_side == "down" and (tick.up_ask - tick.down_ask) >= reversal_gap:
+            return {"up": 0.0, "down": 0.0}
+
+    dominant_ask = tick.up_ask if dominant_side == "up" else tick.down_ask
+    hedge_ask = tick.down_ask if dominant_side == "up" else tick.up_ask
+    dominant_spend = dominant_clip_shares * dominant_ask
+    hedge_spend = hedge_clip_shares * hedge_ask
+
+    projected = _projected_cost_ratio(
+        pos,
+        add_up_spend=dominant_spend if dominant_side == "up" else hedge_spend,
+        add_down_spend=hedge_spend if dominant_side == "up" else dominant_spend,
+        up_ask=tick.up_ask,
+        down_ask=tick.down_ask,
+    )
+    if projected > max_projected_ratio:
+        return {"up": 0.0, "down": 0.0}
+
+    if dominant_side == "up":
+        return {"up": round(dominant_spend, 6), "down": round(hedge_spend, 6)}
+    return {"up": round(hedge_spend, 6), "down": round(dominant_spend, 6)}
+
+
+def policy_market_favorite_share_clips(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    if tick.up_ask <= 0 or tick.down_ask <= 0:
+        return {"up": 0.0, "down": 0.0}
+
+    elapsed = 300.0 - tick.seconds_remaining
+    min_start = float(config.get("favorite_start_secs", 15.0))
+    favorite_gap = float(config.get("favorite_gap", 0.05))
+    dominant_clip_shares = float(config.get("dominant_clip_shares", 58.0))
+    hedge_clip_shares = float(config.get("hedge_clip_shares", 20.0))
+    max_projected_ratio = float(config.get("max_projected_cost_ratio", 0.98))
+    late_start = float(config.get("late_reversal_start_secs", 180.0))
+    reversal_gap = float(config.get("late_reversal_gap", 0.18))
+
+    if pos.up_shares > pos.down_shares:
+        dominant_side = "up"
+    elif pos.down_shares > pos.up_shares:
+        dominant_side = "down"
+    else:
+        if elapsed < min_start:
+            return {"up": 0.0, "down": 0.0}
+        ask_gap = tick.up_ask - tick.down_ask
+        if abs(ask_gap) < favorite_gap:
+            return {"up": 0.0, "down": 0.0}
+        dominant_side = "up" if tick.up_ask > tick.down_ask else "down"
+
+    if elapsed >= late_start:
+        if dominant_side == "up" and (tick.down_ask - tick.up_ask) >= reversal_gap:
+            return {"up": 0.0, "down": 0.0}
+        if dominant_side == "down" and (tick.up_ask - tick.down_ask) >= reversal_gap:
+            return {"up": 0.0, "down": 0.0}
+
+    dominant_ask = tick.up_ask if dominant_side == "up" else tick.down_ask
+    hedge_ask = tick.down_ask if dominant_side == "up" else tick.up_ask
+    dominant_spend = dominant_clip_shares * dominant_ask
+    hedge_spend = hedge_clip_shares * hedge_ask
+    projected = _projected_cost_ratio(
+        pos,
+        add_up_spend=dominant_spend if dominant_side == "up" else hedge_spend,
+        add_down_spend=hedge_spend if dominant_side == "up" else dominant_spend,
+        up_ask=tick.up_ask,
+        down_ask=tick.down_ask,
+    )
+    if projected > max_projected_ratio:
+        return {"up": 0.0, "down": 0.0}
+
+    if dominant_side == "up":
+        return {"up": round(dominant_spend, 6), "down": round(hedge_spend, 6)}
+    return {"up": round(hedge_spend, 6), "down": round(dominant_spend, 6)}
+
+
+def policy_favorite_cost_capped_share_clips(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    if tick.up_ask <= 0 or tick.down_ask <= 0:
+        return {"up": 0.0, "down": 0.0}
+
+    elapsed = 300.0 - tick.seconds_remaining
+    start_secs = float(config.get("entry_start_secs", 15.0))
+    min_spread = float(config.get("min_spread_gap", 0.05))
+    max_spread = float(config.get("max_spread_gap", 0.50))
+    dominant_clip_shares = float(config.get("dominant_clip_shares", 58.0))
+    hedge_clip_shares = float(config.get("hedge_clip_shares", 20.0))
+    max_projected_ratio = float(config.get("max_projected_cost_ratio", 0.89))
+    late_start = float(config.get("late_reversal_start_secs", 180.0))
+    reversal_gap = float(config.get("late_reversal_gap", 0.18))
+
+    ask_gap = abs(tick.up_ask - tick.down_ask)
+    if pos.up_shares > pos.down_shares:
+        dominant_side = "up"
+    elif pos.down_shares > pos.up_shares:
+        dominant_side = "down"
+    else:
+        if elapsed < start_secs:
+            return {"up": 0.0, "down": 0.0}
+        if ask_gap < min_spread or ask_gap > max_spread:
+            return {"up": 0.0, "down": 0.0}
+        dominant_side = "up" if tick.up_ask > tick.down_ask else "down"
+
+    if elapsed >= late_start:
+        if dominant_side == "up" and (tick.down_ask - tick.up_ask) >= reversal_gap:
+            return {"up": 0.0, "down": 0.0}
+        if dominant_side == "down" and (tick.up_ask - tick.down_ask) >= reversal_gap:
+            return {"up": 0.0, "down": 0.0}
+
+    dominant_ask = tick.up_ask if dominant_side == "up" else tick.down_ask
+    hedge_ask = tick.down_ask if dominant_side == "up" else tick.up_ask
+    dominant_spend = dominant_clip_shares * dominant_ask
+    hedge_spend = hedge_clip_shares * hedge_ask
+    projected = _projected_cost_ratio(
+        pos,
+        add_up_spend=dominant_spend if dominant_side == "up" else hedge_spend,
+        add_down_spend=hedge_spend if dominant_side == "up" else dominant_spend,
+        up_ask=tick.up_ask,
+        down_ask=tick.down_ask,
+    )
+    if projected > max_projected_ratio:
+        return {"up": 0.0, "down": 0.0}
+
+    if dominant_side == "up":
+        return {"up": round(dominant_spend, 6), "down": round(hedge_spend, 6)}
+    return {"up": round(hedge_spend, 6), "down": round(dominant_spend, 6)}
+
+
 POLICIES: dict[str, Callable[[SimPosition, ResearchTick, dict], dict[str, float]]] = {
     "equal_time": policy_equal_time,
     "combined_cost_threshold": policy_combined_cost_threshold,
@@ -634,8 +923,12 @@ POLICIES: dict[str, Callable[[SimPosition, ResearchTick, dict], dict[str, float]
     "winner_lean_btc": policy_winner_lean_btc,
     "hedge_plus_conviction": policy_hedge_conviction,
     "cost_gated_up_bias": policy_cost_gated_up_bias,
+    "cost_gated_up_bias_late_guard": policy_cost_gated_up_bias_late_guard,
     "cost_gated_up_bias_flat_only": policy_cost_gated_up_bias_flat_only,
     "cost_gated_up_bias_momentum": policy_cost_gated_up_bias_momentum,
+    "favorite_cost_capped_share_clips": policy_favorite_cost_capped_share_clips,
+    "market_favorite_share_clips": policy_market_favorite_share_clips,
+    "strength_follow_share_clips": policy_strength_follow_share_clips,
 }
 
 
@@ -746,9 +1039,16 @@ def run_simulation(db: ResearchDatabase, policy_name: str, config: dict):
     assert policy_name in POLICIES, f"unknown policy {policy_name}"
     db.delete_sim_results(policy_name)
     rows = []
+    skipped = 0
+    skip_reasons: dict[str, int] = {}
     for market in db.list_simulatable_markets():
         ctx = db.load_market_context(market["slug"])
         if not ctx or not ctx.ticks:
+            continue
+        quality = assess_market_quality(ctx, config)
+        if not quality.ok:
+            skipped += 1
+            skip_reasons[quality.reason or "unknown"] = skip_reasons.get(quality.reason or "unknown", 0) + 1
             continue
         result = simulate_market(ctx, policy_name, config)
         db.insert_sim_result(result)
@@ -760,6 +1060,9 @@ def run_simulation(db: ResearchDatabase, policy_name: str, config: dict):
     net_values = [row["net_pnl"] for row in rows]
     gross_values = [row["gross_pnl"] for row in rows]
     print(f"Policy {policy_name}: {len(rows)} windows")
+    if skipped:
+        reasons = ", ".join(f"{name}={count}" for name, count in sorted(skip_reasons.items()))
+        print(f"  Skipped windows:  {skipped} ({reasons})")
     print(f"  Total gross P&L: ${sum(gross_values):+.2f}")
     print(f"  Total net P&L:   ${sum(net_values):+.2f}")
     print(f"  Avg net/window:  ${statistics.mean(net_values):+.2f}")
@@ -768,6 +1071,7 @@ def run_simulation(db: ResearchDatabase, policy_name: str, config: dict):
     return {
         "policy": policy_name,
         "n": len(rows),
+        "skipped": skipped,
         "total_gross": sum(gross_values),
         "total_net": sum(net_values),
         "avg_net": statistics.mean(net_values),
@@ -794,6 +1098,7 @@ def main() -> int:
     parser.add_argument("--poll-interval", type=float, default=3.0, help="Collector poll interval in seconds")
     parser.add_argument("--status-interval", type=float, default=30.0, help="Collector heartbeat interval in seconds")
     parser.add_argument("--simulate-paired", action="store_true", help="Run paired policy simulation on the research DB")
+    parser.add_argument("--analyze-early-btc", action="store_true", help="Analyze early BTC momentum checkpoints against resolved winners")
     parser.add_argument("--policy", choices=["all"] + sorted(POLICIES.keys()), default="equal_time")
     parser.add_argument("--policy-config", default="", help="JSON string or path for policy configuration")
     parser.add_argument("--log-level", default="INFO")
@@ -815,6 +1120,9 @@ def main() -> int:
                 run_simulation_suite(db, config)
             else:
                 run_simulation(db, args.policy, config)
+        if args.analyze_early_btc:
+            config = _load_policy_config(args.policy_config)
+            analyze_early_btc_signal(db, config)
     finally:
         db.close()
     return 0

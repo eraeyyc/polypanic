@@ -12,7 +12,7 @@ direction. The current main path is paired hold-to-resolution research in
 wallet behavior.
 
 Setup (one-time):
-    pip install py-clob-client websockets
+    pip install py-clob-client-v2 websockets
     python trader.py --setup-keys --private-key 0x...
 
 Run (live):
@@ -22,10 +22,9 @@ Run (live):
 The private key can also be set via the POLYMARKET_PRIVATE_KEY environment
 variable to avoid it appearing in shell history.
 
-Fees are modeled from the documented fee-rate fields returned by Polymarket.
-Do not trust static comments or rough hand calculations here; live fills are
-recorded with fee-aware accounting and should be validated against exchange
-truth before risking capital.
+V2 market-buy sizing is fee-adjusted by the SDK when `user_usdc_balance` is
+provided. Live accounting should rely on exchange/fill data rather than local
+fee formulas.
 """
 
 import os
@@ -56,19 +55,21 @@ from observer import (
     analyze,
 )
 
-# ── py-clob-client (required for live trading) ────────────────────────────────
+# ── py-clob-client-v2 (required for live trading) ─────────────────────────────
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import (
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import (
         ApiCreds,
         BalanceAllowanceParams,
         AssetType,
         MarketOrderArgs,
         OpenOrderParams,
+        OrderMarketCancelParams,
         OrderType,
+        OrderPayload,
         TradeParams,
     )
-    from py_clob_client.order_builder.constants import BUY, SELL
+    from py_clob_client_v2.order_builder.constants import BUY, SELL
     HAS_CLOB = True
 except ImportError:
     HAS_CLOB = False
@@ -84,6 +85,10 @@ except ImportError:
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WS_USER_URL   = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 DATA_API      = "https://data-api.polymarket.com"
+DEFAULT_LIVE_CLOB_HOST = os.environ.get("POLYMARKET_CLOB_HOST", "https://clob-v2.polymarket.com")
+PUSD_DOCS_URL = "https://docs.polymarket.com/concepts/pusd"
+COLLATERAL_ONRAMP_ADDRESS = "0x39AA0C021dfbaE8faC545936693aC917d5E7563"
+PUSD_TOKEN_ADDRESS = "0x4C221Fa6ad61eF08A43c40F0EA4C9D9b2482Db17"
 POLYGON_RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 ERC1155_BALANCE_OF_SELECTOR = "0x00fdd58e"
@@ -122,12 +127,25 @@ def _parse_ts(value) -> float:
         return _now_ts()
 
 
+def _best_effort_create_or_derive_api_creds(client: "ClobClient") -> ApiCreds:
+    try:
+        return client.derive_api_key()
+    except Exception:
+        return client.create_api_key()
+
+
+def _extract_order_id(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    return payload.get("orderID") or payload.get("orderId") or payload.get("id") or ""
+
+
 @dataclass
 class MarketConstraints:
     token_id: str
     tick_size: float
     min_order_size: float
-    fee_rate_bps: int
+    condition_id: str = ""
 
 
 @dataclass
@@ -776,6 +794,13 @@ class LiveTrader:
         self._asset_map[down_token] = (slug, "down")
         if condition_id or market_id:
             self._market_ids.add(condition_id or market_id)
+            try:
+                self._cache_constraints_from_market_info(
+                    condition_id or market_id,
+                    self.clob.get_clob_market_info(condition_id or market_id),
+                )
+            except Exception as exc:
+                logging.warning(f"Market info prefetch failed for {slug}: {exc}")
         self._refresh_constraints(up_token)
         self._refresh_constraints(down_token)
         self.db.upsert_live_market_state({
@@ -852,17 +877,49 @@ class LiveTrader:
     def _clear_error(self):
         self._consecutive_errors = 0
 
-    def _refresh_constraints(self, token_id: str) -> Optional[MarketConstraints]:
-        try:
-            book = self.clob.get_order_book(token_id)
-            tick_size = _safe_float(book.tick_size, 0.01)
-            min_order_size = _safe_float(book.min_order_size, 0.0)
-            fee_rate_bps = int(self.clob.get_fee_rate_bps(token_id) or 0)
+    def _condition_for_token(self, token_id: str) -> str:
+        mapping = self._asset_map.get(token_id)
+        if not mapping:
+            return ""
+        slug, _side = mapping
+        return self._market(slug)
+
+    def _cache_constraints_from_market_info(self, condition_id: str, info: dict):
+        tick_size = _safe_float(info.get("mts"), 0.01)
+        min_order_size = _safe_float(info.get("mos"), 0.0)
+        for token in info.get("t", []) or []:
+            token_id = token.get("t") if isinstance(token, dict) else None
+            if not token_id:
+                continue
             self.constraints[token_id] = MarketConstraints(
                 token_id=token_id,
                 tick_size=tick_size,
                 min_order_size=min_order_size,
-                fee_rate_bps=fee_rate_bps,
+                condition_id=condition_id,
+            )
+
+    def _refresh_constraints(self, token_id: str) -> Optional[MarketConstraints]:
+        try:
+            condition_id = self._condition_for_token(token_id)
+            if condition_id:
+                info = self.clob.get_clob_market_info(condition_id)
+                self._cache_constraints_from_market_info(condition_id, info)
+                return self.constraints.get(token_id)
+
+            book = self.clob.get_order_book(token_id)
+            tick_size = _safe_float(
+                book.get("tick_size") if isinstance(book, dict) else getattr(book, "tick_size", 0.01),
+                0.01,
+            )
+            min_order_size = _safe_float(
+                book.get("min_order_size") if isinstance(book, dict) else getattr(book, "min_order_size", 0.0),
+                0.0,
+            )
+            self.constraints[token_id] = MarketConstraints(
+                token_id=token_id,
+                tick_size=tick_size,
+                min_order_size=min_order_size,
+                condition_id=condition_id,
             )
             return self.constraints[token_id]
         except Exception as exc:
@@ -925,6 +982,38 @@ class LiveTrader:
 
     def _allowance_cache_ttl(self) -> float:
         return 2.0
+
+    @staticmethod
+    def _extract_balance_allowance(resp: dict) -> dict[str, float | bool]:
+        raw_balance = resp.get("balance")
+        if raw_balance is None:
+            raw_balance = resp.get("available")
+        raw_allowance = resp.get("allowance")
+        if raw_allowance is None:
+            raw_allowance = resp.get("approved")
+        return {
+            "balance": _safe_float(raw_balance),
+            "allowance": _safe_float(raw_allowance),
+            "has_balance": raw_balance is not None,
+            "has_allowance": raw_allowance is not None,
+        }
+
+    def _fetch_allowance_state(self, token_id: str, side: str, *, use_cache: bool = True) -> dict[str, float | bool]:
+        cache_key = self._allowance_cache_key(token_id, side)
+        now = _now_ts()
+        cached = self._allowance_cache.get(cache_key)
+        if use_cache and cached and now - cached.get("ts", 0.0) <= self._allowance_cache_ttl():
+            return cached
+
+        if side == "buy":
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        else:
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        resp = self.clob.get_balance_allowance(params)
+        state = self._extract_balance_allowance(resp)
+        state["ts"] = now
+        self._allowance_cache[cache_key] = state
+        return state
 
     def _consume_allowance_cache(self, token_id: str, side: str, shares: float, notional: float):
         key = self._allowance_cache_key(token_id, side)
@@ -1032,38 +1121,11 @@ class LiveTrader:
 
     def _check_allowance(self, token_id: str, side: str, expected_shares: float, expected_notional: float) -> bool:
         try:
-            cache_key = self._allowance_cache_key(token_id, side)
-            cached = self._allowance_cache.get(cache_key)
-            now = _now_ts()
-            if cached and now - cached.get("ts", 0.0) <= self._allowance_cache_ttl():
-                balance = cached.get("balance", 0.0)
-                allowance = cached.get("allowance", 0.0)
-                has_balance = cached.get("has_balance", 1.0) > 0
-                has_allowance = cached.get("has_allowance", 1.0) > 0
-            else:
-                if side == "buy":
-                    params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-                    resp = self.clob.get_balance_allowance(params)
-                else:
-                    params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-                    resp = self.clob.get_balance_allowance(params)
-                raw_balance = resp.get("balance")
-                if raw_balance is None:
-                    raw_balance = resp.get("available")
-                raw_allowance = resp.get("allowance")
-                if raw_allowance is None:
-                    raw_allowance = resp.get("approved")
-                balance = _safe_float(raw_balance)
-                allowance = _safe_float(raw_allowance)
-                has_balance = raw_balance is not None
-                has_allowance = raw_allowance is not None
-                self._allowance_cache[cache_key] = {
-                    "ts": now,
-                    "balance": balance,
-                    "allowance": allowance,
-                    "has_balance": 1.0 if has_balance else 0.0,
-                    "has_allowance": 1.0 if has_allowance else 0.0,
-                }
+            state = self._fetch_allowance_state(token_id, side)
+            balance = state.get("balance", 0.0)
+            allowance = state.get("allowance", 0.0)
+            has_balance = bool(state.get("has_balance"))
+            has_allowance = bool(state.get("has_allowance"))
             required = expected_notional if side == "buy" else expected_shares
             if has_balance and balance + 1e-9 < required:
                 logging.warning(
@@ -1079,13 +1141,58 @@ class LiveTrader:
             logging.warning(f"Allowance preflight failed ({side}): {exc}")
         return True
 
+    def _require_pusd_collateral(self):
+        state = self._fetch_allowance_state("", "buy", use_cache=False)
+        min_required = max(self.config.min_position_usdc, min(self.config.max_position_size, self.config.starting_bankroll))
+        balance = float(state.get("balance", 0.0))
+        allowance = float(state.get("allowance", 0.0))
+        if balance + 1e-9 < self.config.min_position_usdc:
+            raise RuntimeError(
+                "Insufficient pUSD collateral for live trading. "
+                f"Available collateral={balance:.4f}, minimum trade={self.config.min_position_usdc:.4f}. "
+                f"Wrap USDC.e into pUSD via the Collateral Onramp ({COLLATERAL_ONRAMP_ADDRESS}) "
+                f"first. Docs: {PUSD_DOCS_URL}"
+            )
+        if allowance + 1e-9 < min_required:
+            raise RuntimeError(
+                "Collateral allowance is too low for the configured live size. "
+                f"Allowance={allowance:.4f}, required>={min_required:.4f}. "
+                f"Approve pUSD to the Collateral Onramp ({COLLATERAL_ONRAMP_ADDRESS}) "
+                f"and verify the pUSD token ({PUSD_TOKEN_ADDRESS}) is funded. Docs: {PUSD_DOCS_URL}"
+            )
+
+    def validate_startup_readiness(self):
+        self._require_pusd_collateral()
+        self._sync_open_orders()
+
+    @staticmethod
+    def _extract_fee_from_event(event: dict) -> tuple[float, str]:
+        if not isinstance(event, dict):
+            return 0.0, "USDC"
+        for key in ("fee_amount", "feeAmount", "fee", "fee_paid", "feePaid"):
+            value = event.get(key)
+            if value is not None:
+                asset = event.get("fee_asset") or event.get("feeAsset") or "USDC"
+                return _safe_float(value), str(asset).upper()
+        return 0.0, "USDC"
+
+    def _summarize_fill_fees(self, order_id: str, confirmed_delta: float) -> tuple[float, str]:
+        fills = self.db.get_live_fills(order_id)
+        if not fills:
+            return 0.0, "USDC"
+        total_shares = sum((_safe_float(fill["fill_shares"]) for fill in fills), 0.0)
+        total_fee = sum((_safe_float(fill["fee_amount"]) for fill in fills), 0.0)
+        fee_asset = next((str(fill["fee_asset"]).upper() for fill in fills if fill["fee_asset"]), "USDC")
+        if total_shares <= 0 or confirmed_delta <= 0:
+            return 0.0, fee_asset
+        ratio = min(1.0, confirmed_delta / total_shares)
+        return total_fee * ratio, fee_asset
+
     def _apply_confirmed_sell(self, order: LiveOrderState, confirmed_delta: float):
         if confirmed_delta <= 1e-9:
             return
         fill_price = order.avg_fill_price or order.requested_price
-        fee_amount, fee_asset, _ = self._compute_fee(
-            confirmed_delta, fill_price, "sell", order.fee_rate_bps
-        )
+        fee_amount, fee_asset = self._summarize_fill_fees(order.order_id, confirmed_delta)
         self._apply_fill_to_positions(order, confirmed_delta, fill_price, fee_amount, fee_asset)
 
     def _confirm_tentative_sells(self):
@@ -1326,7 +1433,7 @@ class LiveTrader:
 
     def _sync_open_orders(self):
         try:
-            exchange_orders = self.clob.get_orders(OpenOrderParams())
+            exchange_orders = self.clob.get_open_orders(OpenOrderParams())
             exchange_ids = set()
             for raw in exchange_orders:
                 order_id = raw.get("id") or raw.get("order_id") or ""
@@ -1441,16 +1548,6 @@ class LiveTrader:
         except Exception as exc:
             self._record_error(f"Position reconciliation failed: {exc}")
 
-    def _compute_fee(self, shares: float, price: float, action: str, fee_rate_bps: int) -> tuple[float, str, float]:
-        fee_rate = max(0.0, fee_rate_bps) / 10000.0
-        if fee_rate <= 0 or shares <= 0:
-            return 0.0, "USDC", 0.0
-        if action == "buy":
-            fee_shares = shares * fee_rate * (1.0 - price)
-            return fee_shares * price, "SHARES", fee_shares
-        fee_usdc = shares * fee_rate * price * (1.0 - price)
-        return fee_usdc, "USDC", 0.0
-
     def _apply_fill_to_positions(self, order: LiveOrderState, fill_shares: float, fill_price: float, fee_amount: float, fee_asset: str):
         key = self._key(order.slug, order.side)
         pos = self.actual_positions.get(key)
@@ -1553,10 +1650,7 @@ class LiveTrader:
                     continue
                 trade_id = event.get("id")
                 price = _safe_float(event.get("price"))
-                fill_action = "buy" if order.intent == "buy" else "sell"
-                fee_amount, fee_asset, _ = self._compute_fee(
-                    matched, price, fill_action, order.fee_rate_bps
-                )
+                fee_amount, fee_asset = self._extract_fee_from_event(event)
                 fill = {
                     "trade_id": f"{trade_id}:{order_id}" if trade_id else f"{order_id}:{event.get('timestamp')}",
                     "order_id": order_id,
@@ -1677,7 +1771,7 @@ class LiveTrader:
         if etype == "tick_size_change":
             asset_id = event.get("asset_id")
             if asset_id:
-                self.clob.clear_tick_size_cache(asset_id)
+                self.constraints.pop(asset_id, None)
                 self._refresh_constraints(asset_id)
         elif etype == "market_resolved":
             market_id = event.get("market") or event.get("condition_id") or ""
@@ -1737,6 +1831,8 @@ class LiveTrader:
                 return
             if not self._check_allowance(token_id, "buy", est_shares, size_usdc):
                 return
+            collateral_state = self._fetch_allowance_state(token_id, "buy")
+            user_usdc_balance = max(_safe_float(collateral_state.get("balance")), size_usdc)
 
             client_order_id = uuid.uuid4().hex
             order_state = LiveOrderState(
@@ -1752,7 +1848,7 @@ class LiveTrader:
                 requested_price=est_price,
                 requested_shares=est_shares,
                 requested_notional=size_usdc,
-                fee_rate_bps=constraint.fee_rate_bps,
+                fee_rate_bps=0,
                 created_at=now,
                 updated_at=now,
                 status="pending_submit",
@@ -1769,11 +1865,12 @@ class LiveTrader:
                     side=BUY,
                     price=est_price,
                     order_type=OrderType.FAK,
+                    user_usdc_balance=user_usdc_balance,
                 )
             )
             resp = self.clob.post_order(signed, OrderType.FAK)
             self._consume_allowance_cache(token_id, "buy", est_shares, size_usdc)
-            order_state.order_id = resp.get("orderID", "")
+            order_state.order_id = _extract_order_id(resp)
             order_state.status = (resp.get("status") or "submitted").lower()
             order_state.updated_at = _now_ts()
             order_state.raw_json = json.dumps(resp)
@@ -1855,7 +1952,7 @@ class LiveTrader:
                 requested_price=est_price,
                 requested_shares=round(sell_shares, 4),
                 requested_notional=round(sell_shares * est_price, 4),
-                fee_rate_bps=constraint.fee_rate_bps,
+                fee_rate_bps=0,
                 created_at=now,
                 updated_at=now,
                 status="pending_submit",
@@ -1877,7 +1974,7 @@ class LiveTrader:
             )
             resp = self.clob.post_order(signed, OrderType.FAK)
             self._consume_allowance_cache(token_id, "sell", sell_shares, sell_shares * est_price)
-            order_state.order_id = resp.get("orderID", "")
+            order_state.order_id = _extract_order_id(resp)
             order_state.status = (resp.get("status") or "submitted").lower()
             order_state.updated_at = _now_ts()
             order_state.raw_json = json.dumps(resp)
@@ -1914,10 +2011,10 @@ class LiveTrader:
         market_id = self._market(slug)
         try:
             if market_id:
-                self.clob.cancel_market_orders(market=market_id)
+                self.clob.cancel_market_orders(OrderMarketCancelParams(market=market_id))
             else:
                 for order_id in open_order_ids:
-                    self.clob.cancel(order_id)
+                    self.clob.cancel_order(OrderPayload(orderID=order_id))
             for order in self.open_orders.values():
                 if order.slug == slug and order.status not in {"filled", "confirmed", "failed"}:
                     order.status = "cancel_pending"
@@ -1958,14 +2055,14 @@ class LiveObserver(Observer):
       run()               — wraps super().run() with heartbeat start/stop
     """
 
-    def __init__(self, config: StrategyConfig, db_path: str, clob: ClobClient):
+    def __init__(self, config: StrategyConfig, db_path: str, clob: ClobClient, clob_host: str):
         # Build the trader first so it owns the single DB connection for this run.
         trader = LiveTrader(config, Database(db_path), clob)
 
         # super().__init__ opens its own Database(db_path) and saves config to it.
         # We close that connection immediately after and use trader.db instead,
         # so only one SQLite connection is alive at a time.
-        super().__init__(config, db_path, trader=trader)
+        super().__init__(config, db_path, trader=trader, poly_host=clob_host)
         self.db.close()          # close the connection Observer just opened
         self.db     = trader.db  # use the one LiveTrader already holds
         self.trader = trader
@@ -2024,6 +2121,7 @@ class LiveObserver(Observer):
         logging.info("Heartbeat and WebSocket stopped.")
 
     def run(self):
+        self.trader.validate_startup_readiness()
         self.trader.start_heartbeat()
         self.trader.start_reconciliation()
         self.trader.reconcile_exchange_state()
@@ -2102,17 +2200,18 @@ def setup_keys(
     chain_id: int = 137,
     signature_type: int = 1,
     funder: Optional[str] = None,
+    host: str = DEFAULT_LIVE_CLOB_HOST,
 ):
     """
     One-time setup: derive Polymarket API credentials from a wallet private key.
     Saves key/secret/passphrase to keys_file (chmod 600).
 
-    The py-clob-client derives credentials deterministically from the private
-    key via create_or_derive_api_creds() — running this again with the same
-    key returns the same credentials.
+    The V2 Python client still supports deterministic API-key derivation. If
+    the key does not exist yet, create it once and persist the returned
+    key/secret/passphrase locally.
     """
     if not HAS_CLOB:
-        print("Error: py-clob-client not installed. Run: pip install py-clob-client")
+        print("Error: py-clob-client-v2 not installed. Run: pip install py-clob-client-v2")
         sys.exit(1)
 
     if signature_type != 0 and not funder:
@@ -2128,13 +2227,13 @@ def setup_keys(
 
     # L1 client only — no creds needed yet, just the private key
     client = ClobClient(
-        host=CLOB_API,
+        host=host,
         key=private_key,
         chain_id=chain_id,
         signature_type=signature_type,
         funder=funder,
     )
-    creds = client.create_or_derive_api_creds()
+    creds = _best_effort_create_or_derive_api_creds(client)
 
     keys_path = Path(keys_file).expanduser()
     keys_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2159,10 +2258,10 @@ def setup_keys(
     if funder:
         print(f"   funder: {funder}")
     print()
-    print("Before trading you also need to approve USDC and conditional tokens on Polygon:")
-    print("  from py_clob_client.clob_types import BalanceAllowanceParams, AssetType")
-    print("  client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))")
-    print("  client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id='...'))")
+    print("Before trading you also need pUSD collateral on Polygon.")
+    print(f"Wrap USDC.e into pUSD via the Collateral Onramp: {COLLATERAL_ONRAMP_ADDRESS}")
+    print(f"pUSD docs: {PUSD_DOCS_URL}")
+    print("After wrapping, verify collateral readiness with the live startup check.")
 
 
 def build_client(
@@ -2171,6 +2270,7 @@ def build_client(
     chain_id: int = 137,
     signature_type: Optional[int] = None,
     funder: Optional[str] = None,
+    host: str = DEFAULT_LIVE_CLOB_HOST,
 ) -> "ClobClient":
     """
     Build a fully-authenticated ClobClient (L2) from a saved keys file.
@@ -2178,7 +2278,7 @@ def build_client(
     """
     if not HAS_CLOB:
         raise RuntimeError(
-            "py-clob-client not installed. Run: pip install py-clob-client"
+            "py-clob-client-v2 not installed. Run: pip install py-clob-client-v2"
         )
 
     keys_path = Path(keys_file).expanduser()
@@ -2205,7 +2305,7 @@ def build_client(
         api_passphrase = saved["api_passphrase"],
     )
     return ClobClient(
-        host           = CLOB_API,
+        host           = host,
         key            = private_key,
         chain_id       = chain_id,
         creds          = creds,
@@ -2246,6 +2346,9 @@ Examples:
   # One-time key setup
   python trader.py --setup-keys --private-key 0x...
 
+  # Pre-cutover V2 host test
+  python trader.py --private-key 0x... --clob-host https://clob-v2.polymarket.com
+
   # Start live trading with default thresholds
   python trader.py --private-key 0x...
 
@@ -2268,6 +2371,11 @@ Examples:
         "--keys-file",
         default="~/.polypanic/keys.json",
         help="Path to saved API credentials (default: ~/.polypanic/keys.json)",
+    )
+    parser.add_argument(
+        "--clob-host",
+        default=DEFAULT_LIVE_CLOB_HOST,
+        help=f"CLOB host for live trading/setup (default: {DEFAULT_LIVE_CLOB_HOST})",
     )
     parser.add_argument(
         "--setup-keys",
@@ -2394,6 +2502,7 @@ Examples:
             args.chain_id,
             signature_type=args.signature_type,
             funder=args.funder,
+            host=args.clob_host,
         )
         return
 
@@ -2412,6 +2521,7 @@ Examples:
         args.chain_id,
         signature_type=args.signature_type,
         funder=args.funder,
+        host=args.clob_host,
     )
 
     config = StrategyConfig(
@@ -2439,7 +2549,7 @@ Examples:
         allow_both_sides         = args.both_sides,
     )
 
-    LiveObserver(config, db_path=args.db, clob=clob).run()
+    LiveObserver(config, db_path=args.db, clob=clob, clob_host=args.clob_host).run()
 
 
 if __name__ == "__main__":
