@@ -188,6 +188,39 @@ class ResearchDatabase:
                 ON research_ticks(slug, timestamp);
             CREATE INDEX IF NOT EXISTS idx_research_sim_policy
                 ON research_sim_results(policy, slug);
+
+            CREATE TABLE IF NOT EXISTS paired_paper_trades (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug           TEXT,
+                policy         TEXT,
+                side           TEXT,
+                spend          REAL,
+                ask            REAL,
+                shares         REAL,
+                seconds_remaining REAL,
+                timestamp      REAL,
+                btc_delta      REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS paired_paper_windows (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug           TEXT,
+                policy         TEXT,
+                winner         TEXT,
+                up_spend       REAL,
+                down_spend     REAL,
+                up_shares      REAL,
+                down_shares    REAL,
+                combined_spend REAL,
+                gross_pnl      REAL,
+                net_pnl        REAL,
+                skipped        INTEGER DEFAULT 0,
+                skip_reason    TEXT,
+                closed_at      REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_paper_windows_policy
+                ON paired_paper_windows(policy, slug);
             """
         )
         existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(research_ticks)").fetchall()}
@@ -335,6 +368,48 @@ class ResearchDatabase:
             """,
             (policy,),
         ).fetchone()
+
+    def insert_paper_trade(self, slug: str, policy: str, side: str, spend: float,
+                           ask: float, shares: float, tick: "ResearchTick"):
+        self.conn.execute(
+            "INSERT INTO paired_paper_trades "
+            "(slug, policy, side, spend, ask, shares, seconds_remaining, timestamp, btc_delta) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (slug, policy, side, spend, ask, shares,
+             tick.seconds_remaining, tick.timestamp, tick.btc_delta),
+        )
+        self.conn.commit()
+
+    def insert_paper_window(self, row: dict):
+        self.conn.execute(
+            "INSERT INTO paired_paper_windows "
+            "(slug, policy, winner, up_spend, down_spend, up_shares, down_shares, "
+            "combined_spend, gross_pnl, net_pnl, skipped, skip_reason, closed_at) "
+            "VALUES (:slug,:policy,:winner,:up_spend,:down_spend,:up_shares,:down_shares,"
+            ":combined_spend,:gross_pnl,:net_pnl,:skipped,:skip_reason,:closed_at)",
+            row,
+        )
+        self.conn.commit()
+
+    def paper_summary(self, policy: str) -> dict:
+        rows = self.conn.execute(
+            "SELECT gross_pnl, net_pnl, skipped FROM paired_paper_windows WHERE policy=?",
+            (policy,),
+        ).fetchall()
+        active = [r for r in rows if not r["skipped"]]
+        n = len(active)
+        if not n:
+            return {"n": 0, "skipped": len(rows) - n, "total_net": 0.0, "avg_net": 0.0, "wins": 0}
+        wins = sum(1 for r in active if r["net_pnl"] > 0)
+        return {
+            "n": n,
+            "skipped": len(rows) - n,
+            "total_gross": sum(r["gross_pnl"] for r in active),
+            "total_net": sum(r["net_pnl"] for r in active),
+            "avg_net": sum(r["net_pnl"] for r in active) / n,
+            "wins": wins,
+            "win_pct": 100.0 * wins / n,
+        }
 
     def close(self):
         self.conn.close()
@@ -566,6 +641,7 @@ class ResearchCollector:
         status_interval: float = 30.0,
         btc_stream: str = "rest",
         market_stream: str = "rest",
+        paper: Optional["PairedPaperSession"] = None,
     ):
         start = time.time()
         current_slug = None
@@ -613,6 +689,8 @@ class ResearchCollector:
                         logging.info("Tracking research market %s", slug)
                     current_slug = slug
                     current_tokens = tokens
+                    if paper and tokens:
+                        paper.on_new_market(slug)
 
                 now = time.time()
                 if current_tokens:
@@ -650,6 +728,8 @@ class ResearchCollector:
                         tick_count += 1
                         market_tick_count += 1
                         last_tick = tick
+                        if paper:
+                            paper.on_tick(tick)
                         if status_interval > 0 and (now - last_status_at) >= status_interval:
                             logging.info(
                                 "Collecting %s | ticks=%d market_ticks=%d | %.1fs left | "
@@ -694,6 +774,8 @@ class ResearchCollector:
                             }
                         )
                         logging.info("Resolved %s -> %s", market["slug"], winner)
+                        if paper:
+                            paper.on_resolution(market["slug"], winner)
                 time.sleep(poll_interval)
         finally:
             self.market_ws.stop()
@@ -708,6 +790,116 @@ class ResearchCollector:
                     )
                 else:
                     logging.info("Collector stopped on %s | %d ticks in current market", current_slug, market_tick_count)
+
+
+class PairedPaperSession:
+    """
+    Real-time paper trading runner. Wraps ResearchCollector: collects ticks as
+    normal, and simultaneously applies a policy to each tick, logging simulated
+    entries and per-window P&L to paired_paper_trades / paired_paper_windows.
+    """
+
+    def __init__(self, db: ResearchDatabase, policy_name: str, config: dict):
+        assert policy_name in POLICIES, f"unknown policy {policy_name}"
+        self.db = db
+        self.policy_name = policy_name
+        self.policy_fn = POLICIES[policy_name]
+        self.config = config
+        self.fee_bps = float(config.get("fee_bps", 0.0))
+        self.slippage_bps = float(config.get("slippage_bps", 0.0))
+        self.skip_hours: set[int] = set(config.get("skip_hours", []))
+        self._pos: Optional[SimPosition] = None
+        self._current_slug: Optional[str] = None
+        self._last_exec_ts: Optional[float] = None
+        self._step_secs = float(config.get("step_secs", 20.0))
+        self._windows_done = 0
+        self._session_net = 0.0
+
+    def on_new_market(self, slug: str):
+        """Call when the collector moves to a new market window."""
+        if self._current_slug and self._pos and self._pos.combined_spend > 0:
+            logging.info(
+                "Paper | %s mid-window position carry-over (no resolution yet) up=%.2f dn=%.2f",
+                self._current_slug, self._pos.up_spend, self._pos.down_spend,
+            )
+        self._current_slug = slug
+        self._pos = SimPosition()
+        self._last_exec_ts = None
+
+    def on_tick(self, tick: ResearchTick):
+        """Call for every collected tick. Applies policy and records entries."""
+        if not self._current_slug or self._pos is None:
+            return
+        import datetime as _dt
+        if self.skip_hours and _dt.datetime.fromtimestamp(tick.timestamp).hour in self.skip_hours:
+            return
+        elapsed = 300.0 - tick.seconds_remaining
+        start_after = float(self.config.get("start_after_secs", 0.0))
+        stop_after = float(self.config.get("stop_after_secs", 300.0))
+        if elapsed < start_after or elapsed > stop_after:
+            return
+        if self._last_exec_ts is not None and tick.timestamp - self._last_exec_ts < self._step_secs:
+            return
+        spends = self.policy_fn(self._pos, tick, self.config)
+        fired = False
+        for side in ("up", "down"):
+            spend = spends.get(side, 0.0)
+            if spend <= 0:
+                continue
+            ask_raw = tick.up_ask if side == "up" else tick.down_ask
+            ask = _apply_slippage(ask_raw, self.slippage_bps)
+            if ask <= 0:
+                continue
+            shares = spend / ask
+            _mark_buy(self._pos, side, spend, ask, tick.seconds_remaining)
+            self.db.insert_paper_trade(
+                self._current_slug, self.policy_name, side,
+                spend, ask, shares, tick,
+            )
+            fired = True
+        if fired:
+            self._last_exec_ts = tick.timestamp
+
+    def on_resolution(self, slug: str, winner: str):
+        """Call when a market resolves. Closes the paper window and logs P&L."""
+        pos = self._pos if slug == self._current_slug else SimPosition()
+        combined_spend = pos.combined_spend
+        fee_cost = combined_spend * (self.fee_bps / 10000.0)
+        gross_pnl = (pos.up_shares if winner == "Up" else pos.down_shares) - combined_spend
+        net_pnl = gross_pnl - fee_cost
+        self._windows_done += 1
+        self._session_net += net_pnl
+        self.db.insert_paper_window({
+            "slug": slug,
+            "policy": self.policy_name,
+            "winner": winner,
+            "up_spend": round(pos.up_spend, 6),
+            "down_spend": round(pos.down_spend, 6),
+            "up_shares": round(pos.up_shares, 6),
+            "down_shares": round(pos.down_shares, 6),
+            "combined_spend": round(combined_spend, 6),
+            "gross_pnl": round(gross_pnl, 6),
+            "net_pnl": round(net_pnl, 6),
+            "skipped": 0,
+            "skip_reason": None,
+            "closed_at": time.time(),
+        })
+        summary = self.db.paper_summary(self.policy_name)
+        logging.info(
+            "Paper | %s → %s | spend=$%.2f gross=$%+.2f net=$%+.2f | "
+            "session: %d windows net=$%+.2f avg=$%+.2f win=%.0f%%",
+            slug, winner, combined_spend, gross_pnl, net_pnl,
+            summary["n"], summary["total_net"], summary["avg_net"], summary["win_pct"],
+        )
+
+    def on_skipped(self, slug: str, reason: str):
+        """Call when a window is skipped (hour filter, quality filter, etc.)."""
+        self.db.insert_paper_window({
+            "slug": slug, "policy": self.policy_name, "winner": None,
+            "up_spend": 0.0, "down_spend": 0.0, "up_shares": 0.0, "down_shares": 0.0,
+            "combined_spend": 0.0, "gross_pnl": 0.0, "net_pnl": 0.0,
+            "skipped": 1, "skip_reason": reason, "closed_at": time.time(),
+        })
 
 
 def _mark_buy(pos: SimPosition, side: str, spend: float, ask: float, seconds_remaining: float):
@@ -1505,9 +1697,10 @@ def main() -> int:
     parser.add_argument("--btc-stream", choices=["rest", "binance_ws"], default="rest", help="BTC spot source for collection")
     parser.add_argument("--market-stream", choices=["rest", "ws"], default="rest", help="Polymarket quote source for collection")
     parser.add_argument("--simulate-paired", action="store_true", help="Run paired policy simulation on the research DB")
+    parser.add_argument("--paper-trade", action="store_true", help="Collect live ticks and paper-trade a policy in real time")
     parser.add_argument("--analyze-early-btc", action="store_true", help="Analyze early BTC momentum checkpoints against resolved winners")
     parser.add_argument("--analyze-btc-lag", action="store_true", help="Analyze whether Polymarket quote state lags BTC moves")
-    parser.add_argument("--policy", choices=["all"] + sorted(POLICIES.keys()), default="equal_time")
+    parser.add_argument("--policy", choices=["all"] + sorted(POLICIES.keys()), default="market_favorite_share_clips")
     parser.add_argument("--policy-config", default="", help="JSON string or path for policy configuration")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -1515,7 +1708,14 @@ def main() -> int:
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     db = ResearchDatabase(args.db)
     try:
-        if args.collect:
+        if args.collect or args.paper_trade:
+            config = _load_policy_config(args.policy_config) if args.paper_trade else {}
+            paper = None
+            if args.paper_trade:
+                policy_name = args.policy if args.policy != "all" else "market_favorite_share_clips"
+                paper = PairedPaperSession(db, policy_name, config)
+                logging.info("Paper trading policy=%s skip_hours=%s fee=%.1fbps slippage=%.1fbps",
+                             policy_name, sorted(paper.skip_hours), paper.fee_bps, paper.slippage_bps)
             collector = ResearchCollector(db)
             collector.run(
                 duration_hours=args.duration_hours,
@@ -1523,6 +1723,7 @@ def main() -> int:
                 status_interval=args.status_interval,
                 btc_stream=args.btc_stream,
                 market_stream=args.market_stream,
+                paper=paper,
             )
         if args.simulate_paired:
             config = _load_policy_config(args.policy_config)
