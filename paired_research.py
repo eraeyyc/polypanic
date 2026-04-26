@@ -12,19 +12,29 @@ path. It supports:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
 import sqlite3
 import statistics
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from observer import BTCPriceClient, PolymarketClient
 
+try:
+    import websockets
+    HAS_WS = True
+except ImportError:
+    HAS_WS = False
+
 
 DEFAULT_DB = "paired_research.db"
+POLYMARKET_MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BINANCE_BTC_WS = "wss://stream.binance.com:9443/ws/btcusdt@trade"
 
 
 @dataclass
@@ -38,6 +48,9 @@ class ResearchTick:
     btc_spot: float
     btc_delta: float
     price_source: str = "rest"
+    btc_source_ts: float = 0.0
+    up_quote_ts: float = 0.0
+    down_quote_ts: float = 0.0
 
 
 @dataclass
@@ -94,6 +107,18 @@ class EarlyMomentumObservation:
     btc_delta: float
 
 
+@dataclass
+class LagObservation:
+    slug: str
+    winner: str
+    direction: str
+    btc_event_elapsed_s: float
+    poly_event_elapsed_s: float
+    lag_secs: float
+    btc_delta: float
+    ask_gap: float
+
+
 class ResearchDatabase:
     def __init__(self, db_path: str = DEFAULT_DB):
         self.db_path = db_path
@@ -131,7 +156,10 @@ class ResearchDatabase:
                 down_best_ask      REAL,
                 btc_spot_price     REAL,
                 btc_delta_from_open REAL,
-                price_source       TEXT DEFAULT 'rest'
+                price_source       TEXT DEFAULT 'rest',
+                btc_source_ts      REAL DEFAULT 0,
+                up_quote_ts        REAL DEFAULT 0,
+                down_quote_ts      REAL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS research_sim_results (
@@ -162,6 +190,15 @@ class ResearchDatabase:
                 ON research_sim_results(policy, slug);
             """
         )
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(research_ticks)").fetchall()}
+        extra_columns = {
+            "btc_source_ts": "ALTER TABLE research_ticks ADD COLUMN btc_source_ts REAL DEFAULT 0",
+            "up_quote_ts": "ALTER TABLE research_ticks ADD COLUMN up_quote_ts REAL DEFAULT 0",
+            "down_quote_ts": "ALTER TABLE research_ticks ADD COLUMN down_quote_ts REAL DEFAULT 0",
+        }
+        for column, ddl in extra_columns.items():
+            if column not in existing:
+                self.conn.execute(ddl)
         self.conn.commit()
 
     def upsert_market(self, market: dict):
@@ -192,8 +229,8 @@ class ResearchDatabase:
             INSERT INTO research_ticks
             (slug, timestamp, seconds_remaining, up_best_bid, up_best_ask,
              down_best_bid, down_best_ask, btc_spot_price, btc_delta_from_open,
-             price_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             price_source, btc_source_ts, up_quote_ts, down_quote_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 slug,
@@ -206,6 +243,9 @@ class ResearchDatabase:
                 tick.btc_spot,
                 tick.btc_delta,
                 tick.price_source,
+                tick.btc_source_ts,
+                tick.up_quote_ts,
+                tick.down_quote_ts,
             ),
         )
         self.conn.commit()
@@ -239,6 +279,9 @@ class ResearchDatabase:
                 btc_spot=row["btc_spot_price"],
                 btc_delta=row["btc_delta_from_open"],
                 price_source=row["price_source"] or "rest",
+                btc_source_ts=row["btc_source_ts"] or 0.0,
+                up_quote_ts=row["up_quote_ts"] or 0.0,
+                down_quote_ts=row["down_quote_ts"] or 0.0,
             )
             for row in self.conn.execute(
                 "SELECT * FROM research_ticks WHERE slug=? ORDER BY timestamp",
@@ -297,11 +340,202 @@ class ResearchDatabase:
         self.conn.close()
 
 
+def _parse_event_ts(value, fallback: float) -> float:
+    try:
+        ts = float(value)
+    except Exception:
+        return fallback
+    if ts > 1_000_000_000_000:
+        return ts / 1000.0
+    return ts
+
+
+class BinanceBTCStream:
+    STALE_SEC = 3.0
+
+    def __init__(self, url: str = BINANCE_BTC_WS):
+        self.url = url
+        self._price = 0.0
+        self._event_ts = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if not HAS_WS:
+            logging.warning("websockets not installed; Binance BTC stream unavailable")
+            return
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="binance-btc-stream", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+    def get_price(self) -> Optional[dict]:
+        with self._lock:
+            if self._price <= 0 or (time.time() - self._event_ts) > self.STALE_SEC:
+                return None
+            return {
+                "price": self._price,
+                "source_ts": self._event_ts,
+                "source": "binance_ws",
+            }
+
+    def _run(self):
+        asyncio.run(self._run_async())
+
+    async def _run_async(self):
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(self.url, ping_interval=20, open_timeout=10) as sock:
+                    async for raw in sock:
+                        if self._stop.is_set():
+                            break
+                        payload = json.loads(raw)
+                        price = float(payload.get("p", 0.0))
+                        if price <= 0:
+                            continue
+                        event_ts = _parse_event_ts(payload.get("T") or payload.get("E"), time.time())
+                        with self._lock:
+                            self._price = price
+                            self._event_ts = event_ts
+            except Exception as exc:
+                logging.warning("Binance BTC stream reconnecting after error: %s", exc)
+                await asyncio.sleep(1.0)
+
+
+class PolymarketBestBidAskStream:
+    STALE_SEC = 3.0
+    PING_INTERVAL = 10.0
+
+    def __init__(self, url: str = POLYMARKET_MARKET_WS):
+        self.url = url
+        self._quotes: dict[str, dict] = {}
+        self._token_ids: list[str] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def subscribe(self, token_ids: list[str]):
+        self.stop()
+        self._token_ids = list(token_ids)
+        with self._lock:
+            self._quotes.clear()
+        if not HAS_WS:
+            logging.warning("websockets not installed; Polymarket market stream unavailable")
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="polymarket-bba-stream", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+
+    def get_quote(self, token_id: str) -> Optional[dict]:
+        with self._lock:
+            quote = self._quotes.get(token_id)
+            if not quote:
+                return None
+            if (time.time() - quote["source_ts"]) > self.STALE_SEC:
+                return None
+            return dict(quote)
+
+    def _run(self):
+        asyncio.run(self._run_async())
+
+    async def _run_async(self):
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(self.url, ping_interval=None, open_timeout=10) as sock:
+                    await sock.send(json.dumps({
+                        "assets_ids": self._token_ids,
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    }))
+                    last_ping = time.monotonic()
+                    while not self._stop.is_set():
+                        timeout = max(0.1, self.PING_INTERVAL - (time.monotonic() - last_ping))
+                        try:
+                            raw = await asyncio.wait_for(sock.recv(), timeout=timeout)
+                        except asyncio.TimeoutError:
+                            await sock.send("PING")
+                            last_ping = time.monotonic()
+                            continue
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", "replace")
+                        messages = json.loads(raw)
+                        if isinstance(messages, dict):
+                            messages = [messages]
+                        for message in messages:
+                            self._handle_message(message)
+            except Exception as exc:
+                logging.warning("Polymarket market stream reconnecting after error: %s", exc)
+                await asyncio.sleep(1.0)
+
+    def _handle_message(self, message: dict):
+        event_type = message.get("event_type")
+        if event_type == "book":
+            token_id = message.get("asset_id")
+            if not token_id:
+                return
+            bids = [float(level["price"]) for level in (message.get("bids") or []) if float(level.get("size", 0)) > 0]
+            asks = [float(level["price"]) for level in (message.get("asks") or []) if float(level.get("size", 0)) > 0]
+            if not asks:
+                return
+            quote = {
+                "best_bid": max(bids) if bids else 0.0,
+                "best_ask": min(asks),
+                "source_ts": _parse_event_ts(message.get("timestamp"), time.time()),
+                "source": "poly_ws",
+            }
+            with self._lock:
+                self._quotes[token_id] = quote
+            return
+        if event_type == "best_bid_ask":
+            token_id = message.get("asset_id")
+            if not token_id:
+                return
+            quote = {
+                "best_bid": float(message.get("best_bid", 0.0)),
+                "best_ask": float(message.get("best_ask", 0.0)),
+                "source_ts": _parse_event_ts(message.get("timestamp"), time.time()),
+                "source": "poly_ws",
+            }
+            with self._lock:
+                self._quotes[token_id] = quote
+            return
+        if event_type == "price_change":
+            timestamp = _parse_event_ts(message.get("timestamp"), time.time())
+            for change in message.get("price_changes") or []:
+                token_id = change.get("asset_id")
+                if not token_id:
+                    continue
+                best_bid = float(change.get("best_bid", 0.0))
+                best_ask = float(change.get("best_ask", 0.0))
+                if best_ask <= 0:
+                    continue
+                with self._lock:
+                    self._quotes[token_id] = {
+                        "best_bid": best_bid,
+                        "best_ask": best_ask,
+                        "source_ts": timestamp,
+                        "source": "poly_ws",
+                    }
+
+
 class ResearchCollector:
     def __init__(self, db: ResearchDatabase):
         self.db = db
         self.poly = PolymarketClient()
         self.btc = BTCPriceClient()
+        self.btc_ws = BinanceBTCStream()
+        self.market_ws = PolymarketBestBidAskStream()
 
     def _fetch_resolution(self, slug: str) -> Optional[str]:
         event = self.poly.get_market_by_slug(slug)
@@ -330,6 +564,8 @@ class ResearchCollector:
         duration_hours: float = 24.0,
         poll_interval: float = 3.0,
         status_interval: float = 30.0,
+        btc_stream: str = "rest",
+        market_stream: str = "rest",
     ):
         start = time.time()
         current_slug = None
@@ -339,114 +575,139 @@ class ResearchCollector:
         market_tick_count = 0
         last_status_at = 0.0
         last_tick: Optional[ResearchTick] = None
-        while time.time() - start < duration_hours * 3600:
-            window_start, window_end, slug = self.poly.compute_window_times()
-            if slug != current_slug:
-                if current_slug and market_tick_count:
+        if btc_stream == "binance_ws":
+            self.btc_ws.start()
+        try:
+            while time.time() - start < duration_hours * 3600:
+                window_start, window_end, slug = self.poly.compute_window_times()
+                if slug != current_slug:
+                    if current_slug and market_tick_count:
+                        logging.info(
+                            "Completed market %s | %d ticks collected",
+                            current_slug,
+                            market_tick_count,
+                        )
+                    event = self.poly.get_market_by_slug(slug)
+                    tokens = self.poly.extract_token_ids(event) if event else None
+                    btc_open_snapshot = self.btc_ws.get_price() if btc_stream == "binance_ws" else None
+                    btc_open = btc_open_snapshot["price"] if btc_open_snapshot else self.btc.get_btc_price()
+                    market_tick_count = 0
+                    last_tick = None
+                    if tokens:
+                        if market_stream == "ws":
+                            self.market_ws.subscribe([tokens["up_token_id"], tokens["down_token_id"]])
+                        self.db.upsert_market(
+                            {
+                                "slug": slug,
+                                "window_start_ts": window_start,
+                                "window_end_ts": window_end,
+                                "market_id": tokens.get("market_id", ""),
+                                "condition_id": tokens.get("condition_id", ""),
+                                "up_token_id": tokens["up_token_id"],
+                                "down_token_id": tokens["down_token_id"],
+                                "btc_open_price": btc_open,
+                                "btc_close_price": None,
+                                "resolution": None,
+                            }
+                        )
+                        logging.info("Tracking research market %s", slug)
+                    current_slug = slug
+                    current_tokens = tokens
+
+                now = time.time()
+                if current_tokens:
+                    if market_stream == "ws":
+                        up = self.market_ws.get_quote(current_tokens["up_token_id"])
+                        down = self.market_ws.get_quote(current_tokens["down_token_id"])
+                    else:
+                        up = self.poly.get_price(current_tokens["up_token_id"])
+                        down = self.poly.get_price(current_tokens["down_token_id"])
+                    btc_snapshot = self.btc_ws.get_price() if btc_stream == "binance_ws" else None
+                    if btc_snapshot:
+                        btc_now = btc_snapshot["price"]
+                        btc_source_ts = btc_snapshot["source_ts"]
+                        price_source = f"{market_stream}+{btc_snapshot['source']}"
+                    else:
+                        btc_now = self.btc.get_btc_price()
+                        btc_source_ts = now
+                        price_source = f"{market_stream}+rest"
+                    if up and down and btc_now:
+                        tick = ResearchTick(
+                            timestamp=now,
+                            seconds_remaining=max(0.0, window_end - now),
+                            up_bid=up["best_bid"],
+                            up_ask=up["best_ask"],
+                            down_bid=down["best_bid"],
+                            down_ask=down["best_ask"],
+                            btc_spot=btc_now,
+                            btc_delta=(btc_now - btc_open) if btc_open else 0.0,
+                            price_source=price_source,
+                            btc_source_ts=btc_source_ts,
+                            up_quote_ts=up.get("source_ts", now),
+                            down_quote_ts=down.get("source_ts", now),
+                        )
+                        self.db.insert_tick(current_slug, tick)
+                        tick_count += 1
+                        market_tick_count += 1
+                        last_tick = tick
+                        if status_interval > 0 and (now - last_status_at) >= status_interval:
+                            logging.info(
+                                "Collecting %s | ticks=%d market_ticks=%d | %.1fs left | "
+                                "UP %.2f/%.2f DN %.2f/%.2f | BTC $%.2f (%+.2f) | %s",
+                                current_slug,
+                                tick_count,
+                                market_tick_count,
+                                tick.seconds_remaining,
+                                tick.up_bid,
+                                tick.up_ask,
+                                tick.down_bid,
+                                tick.down_ask,
+                                tick.btc_spot,
+                                tick.btc_delta,
+                                tick.price_source,
+                            )
+                            last_status_at = now
+
+                for market in self.db.conn.execute(
+                    """
+                    SELECT slug, window_end_ts FROM research_markets
+                    WHERE resolution IS NULL AND window_end_ts <= ?
+                    """,
+                    (time.time() - 15.0,),
+                ).fetchall():
+                    winner = self._fetch_resolution(market["slug"])
+                    btc_close_snapshot = self.btc_ws.get_price() if btc_stream == "binance_ws" else None
+                    btc_close = btc_close_snapshot["price"] if btc_close_snapshot else self.btc.get_btc_price()
+                    if winner:
+                        self.db.upsert_market(
+                            {
+                                "slug": market["slug"],
+                                "window_start_ts": None,
+                                "window_end_ts": market["window_end_ts"],
+                                "market_id": "",
+                                "condition_id": "",
+                                "up_token_id": "",
+                                "down_token_id": "",
+                                "btc_open_price": None,
+                                "btc_close_price": btc_close,
+                                "resolution": winner,
+                            }
+                        )
+                        logging.info("Resolved %s -> %s", market["slug"], winner)
+                time.sleep(poll_interval)
+        finally:
+            self.market_ws.stop()
+            self.btc_ws.stop()
+            if current_slug and market_tick_count:
+                if last_tick is not None:
                     logging.info(
-                        "Completed market %s | %d ticks collected",
+                        "Collector stopped on %s | %d ticks in current market | %.1fs left on last tick",
                         current_slug,
                         market_tick_count,
+                        last_tick.seconds_remaining,
                     )
-                event = self.poly.get_market_by_slug(slug)
-                tokens = self.poly.extract_token_ids(event) if event else None
-                btc_open = self.btc.get_btc_price()
-                market_tick_count = 0
-                last_tick = None
-                if tokens:
-                    self.db.upsert_market(
-                        {
-                            "slug": slug,
-                            "window_start_ts": window_start,
-                            "window_end_ts": window_end,
-                            "market_id": tokens.get("market_id", ""),
-                            "condition_id": tokens.get("condition_id", ""),
-                            "up_token_id": tokens["up_token_id"],
-                            "down_token_id": tokens["down_token_id"],
-                            "btc_open_price": btc_open,
-                            "btc_close_price": None,
-                            "resolution": None,
-                        }
-                    )
-                    logging.info("Tracking research market %s", slug)
-                current_slug = slug
-                current_tokens = tokens
-
-            now = time.time()
-            if current_tokens:
-                up = self.poly.get_price(current_tokens["up_token_id"])
-                down = self.poly.get_price(current_tokens["down_token_id"])
-                btc_now = self.btc.get_btc_price()
-                if up and down and btc_now:
-                    tick = ResearchTick(
-                        timestamp=now,
-                        seconds_remaining=max(0.0, window_end - now),
-                        up_bid=up["best_bid"],
-                        up_ask=up["best_ask"],
-                        down_bid=down["best_bid"],
-                        down_ask=down["best_ask"],
-                        btc_spot=btc_now,
-                        btc_delta=(btc_now - btc_open) if btc_open else 0.0,
-                        price_source="rest",
-                    )
-                    self.db.insert_tick(current_slug, tick)
-                    tick_count += 1
-                    market_tick_count += 1
-                    last_tick = tick
-                    if status_interval > 0 and (now - last_status_at) >= status_interval:
-                        logging.info(
-                            "Collecting %s | ticks=%d market_ticks=%d | %.1fs left | "
-                            "UP %.2f/%.2f DN %.2f/%.2f | BTC $%.2f (%+.2f)",
-                            current_slug,
-                            tick_count,
-                            market_tick_count,
-                            tick.seconds_remaining,
-                            tick.up_bid,
-                            tick.up_ask,
-                            tick.down_bid,
-                            tick.down_ask,
-                            tick.btc_spot,
-                            tick.btc_delta,
-                        )
-                        last_status_at = now
-
-            # resolve any expired market that hasn't been finalized yet
-            for market in self.db.conn.execute(
-                """
-                SELECT slug, window_end_ts FROM research_markets
-                WHERE resolution IS NULL AND window_end_ts <= ?
-                """,
-                (time.time() - 15.0,),
-            ).fetchall():
-                winner = self._fetch_resolution(market["slug"])
-                btc_close = self.btc.get_btc_price()
-                if winner:
-                    self.db.upsert_market(
-                        {
-                            "slug": market["slug"],
-                            "window_start_ts": None,
-                            "window_end_ts": market["window_end_ts"],
-                            "market_id": "",
-                            "condition_id": "",
-                            "up_token_id": "",
-                            "down_token_id": "",
-                            "btc_open_price": None,
-                            "btc_close_price": btc_close,
-                            "resolution": winner,
-                        }
-                    )
-                    logging.info("Resolved %s -> %s", market["slug"], winner)
-            time.sleep(poll_interval)
-        if current_slug and market_tick_count:
-            if last_tick is not None:
-                logging.info(
-                    "Collector stopped on %s | %d ticks in current market | %.1fs left on last tick",
-                    current_slug,
-                    market_tick_count,
-                    last_tick.seconds_remaining,
-                )
-            else:
-                logging.info("Collector stopped on %s | %d ticks in current market", current_slug, market_tick_count)
+                else:
+                    logging.info("Collector stopped on %s | %d ticks in current market", current_slug, market_tick_count)
 
 
 def _mark_buy(pos: SimPosition, side: str, spend: float, ask: float, seconds_remaining: float):
@@ -530,6 +791,104 @@ def _extract_early_momentum_observations(
             )
         )
     return observations
+
+
+def _effective_quote_ts(tick: ResearchTick) -> float:
+    quote_ts = max(tick.up_quote_ts or 0.0, tick.down_quote_ts or 0.0)
+    return quote_ts or tick.timestamp
+
+
+def _extract_btc_market_lag_observation(
+    ctx: MarketContext,
+    *,
+    btc_delta_threshold: float,
+    ask_gap_threshold: float,
+    max_elapsed_secs: float,
+) -> Optional[LagObservation]:
+    if not ctx.ticks:
+        return None
+    early_ticks = [tick for tick in ctx.ticks if (300.0 - tick.seconds_remaining) <= max_elapsed_secs]
+    if not early_ticks:
+        return None
+    btc_tick = next((tick for tick in early_ticks if abs(tick.btc_delta) >= btc_delta_threshold), None)
+    if btc_tick is None or btc_tick.btc_delta == 0:
+        return None
+    direction = "Up" if btc_tick.btc_delta > 0 else "Down"
+    poly_tick = None
+    for tick in early_ticks:
+        gap = tick.up_ask - tick.down_ask
+        if direction == "Up" and gap >= ask_gap_threshold:
+            poly_tick = tick
+            break
+        if direction == "Down" and (-gap) >= ask_gap_threshold:
+            poly_tick = tick
+            break
+    if poly_tick is None:
+        return None
+    poly_gap = abs(poly_tick.up_ask - poly_tick.down_ask)
+    return LagObservation(
+        slug=ctx.slug,
+        winner=ctx.winner,
+        direction=direction,
+        btc_event_elapsed_s=300.0 - btc_tick.seconds_remaining,
+        poly_event_elapsed_s=300.0 - poly_tick.seconds_remaining,
+        lag_secs=_effective_quote_ts(poly_tick) - (btc_tick.btc_source_ts or btc_tick.timestamp),
+        btc_delta=btc_tick.btc_delta,
+        ask_gap=poly_gap,
+    )
+
+
+def analyze_btc_market_lag(db: ResearchDatabase, config: dict):
+    btc_delta_threshold = float(config.get("btc_delta_threshold", 5.0))
+    ask_gap_threshold = float(config.get("ask_gap_threshold", 0.05))
+    max_elapsed_secs = float(config.get("max_elapsed_secs", 60.0))
+    observations: list[LagObservation] = []
+    scanned = 0
+    for market in db.list_simulatable_markets():
+        ctx = db.load_market_context(market["slug"])
+        if not ctx or not ctx.ticks:
+            continue
+        scanned += 1
+        obs = _extract_btc_market_lag_observation(
+            ctx,
+            btc_delta_threshold=btc_delta_threshold,
+            ask_gap_threshold=ask_gap_threshold,
+            max_elapsed_secs=max_elapsed_secs,
+        )
+        if obs:
+            observations.append(obs)
+    if not observations:
+        print("No BTC/Polymarket lag observations available.")
+        return
+
+    lags = sorted(o.lag_secs for o in observations)
+    median_lag = statistics.median(lags)
+    avg_lag = statistics.mean(lags)
+    p90_index = min(len(lags) - 1, max(0, int(round(0.9 * len(lags))) - 1))
+    p90_lag = lags[p90_index]
+    lead_count = sum(1 for lag in lags if lag < 0)
+    lag_count = sum(1 for lag in lags if lag > 0)
+    print(
+        "BTC vs Polymarket lag analysis: "
+        f"{len(observations)} observations across {scanned} windows"
+    )
+    print(
+        f"  BTC threshold=${btc_delta_threshold:.2f} | ask gap threshold={ask_gap_threshold:.3f} "
+        f"| early window <= {max_elapsed_secs:.1f}s"
+    )
+    print(
+        f"  Avg lag={avg_lag:+.3f}s | median={median_lag:+.3f}s | p90={p90_lag:+.3f}s "
+        f"| PM leads={lead_count} | PM lags={lag_count}"
+    )
+    for direction in ("Up", "Down"):
+        rows = [o for o in observations if o.direction == direction]
+        if not rows:
+            continue
+        dlags = sorted(o.lag_secs for o in rows)
+        print(
+            f"  {direction}: n={len(rows)} avg={statistics.mean(dlags):+.3f}s "
+            f"median={statistics.median(dlags):+.3f}s"
+        )
 
 
 def analyze_early_btc_signal(db: ResearchDatabase, config: dict):
@@ -666,6 +1025,8 @@ def policy_payout_balanced(pos: SimPosition, tick: ResearchTick, config: dict) -
 
 
 def policy_winner_lean_btc(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    if tick.up_ask <= 0 or tick.down_ask <= 0:
+        return {"up": 0.0, "down": 0.0}
     base = float(config.get("base_notional", 10.0))
     extra = float(config.get("lean_notional", 20.0))
     threshold = float(config.get("btc_delta_threshold", 10.0))
@@ -916,6 +1277,39 @@ def policy_favorite_cost_capped_share_clips(pos: SimPosition, tick: ResearchTick
     return {"up": round(hedge_spend, 6), "down": round(dominant_spend, 6)}
 
 
+def policy_pair_under_40_complete_by_45(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    if tick.up_ask <= 0 or tick.down_ask <= 0:
+        return {"up": 0.0, "down": 0.0}
+
+    spend = float(config.get("notional_each", 25.0))
+    entry_threshold = float(config.get("entry_threshold", 0.40))
+    completion_threshold = float(config.get("completion_threshold", 0.45))
+
+    has_up = pos.up_shares > 0
+    has_down = pos.down_shares > 0
+    if has_up and has_down:
+        return {"up": 0.0, "down": 0.0}
+
+    buy_up = False
+    buy_down = False
+
+    if not has_up and not has_down:
+        if tick.up_ask <= entry_threshold:
+            buy_up = True
+        if tick.down_ask <= entry_threshold:
+            buy_down = True
+    else:
+        if not has_up and tick.up_ask <= completion_threshold:
+            buy_up = True
+        if not has_down and tick.down_ask <= completion_threshold:
+            buy_down = True
+
+    return {
+        "up": spend if buy_up else 0.0,
+        "down": spend if buy_down else 0.0,
+    }
+
+
 POLICIES: dict[str, Callable[[SimPosition, ResearchTick, dict], dict[str, float]]] = {
     "equal_time": policy_equal_time,
     "combined_cost_threshold": policy_combined_cost_threshold,
@@ -928,6 +1322,7 @@ POLICIES: dict[str, Callable[[SimPosition, ResearchTick, dict], dict[str, float]
     "cost_gated_up_bias_momentum": policy_cost_gated_up_bias_momentum,
     "favorite_cost_capped_share_clips": policy_favorite_cost_capped_share_clips,
     "market_favorite_share_clips": policy_market_favorite_share_clips,
+    "pair_under_40_complete_by_45": policy_pair_under_40_complete_by_45,
     "strength_follow_share_clips": policy_strength_follow_share_clips,
 }
 
@@ -1097,8 +1492,11 @@ def main() -> int:
     parser.add_argument("--duration-hours", type=float, default=24.0, help="Collector run duration")
     parser.add_argument("--poll-interval", type=float, default=3.0, help="Collector poll interval in seconds")
     parser.add_argument("--status-interval", type=float, default=30.0, help="Collector heartbeat interval in seconds")
+    parser.add_argument("--btc-stream", choices=["rest", "binance_ws"], default="rest", help="BTC spot source for collection")
+    parser.add_argument("--market-stream", choices=["rest", "ws"], default="rest", help="Polymarket quote source for collection")
     parser.add_argument("--simulate-paired", action="store_true", help="Run paired policy simulation on the research DB")
     parser.add_argument("--analyze-early-btc", action="store_true", help="Analyze early BTC momentum checkpoints against resolved winners")
+    parser.add_argument("--analyze-btc-lag", action="store_true", help="Analyze whether Polymarket quote state lags BTC moves")
     parser.add_argument("--policy", choices=["all"] + sorted(POLICIES.keys()), default="equal_time")
     parser.add_argument("--policy-config", default="", help="JSON string or path for policy configuration")
     parser.add_argument("--log-level", default="INFO")
@@ -1113,6 +1511,8 @@ def main() -> int:
                 duration_hours=args.duration_hours,
                 poll_interval=args.poll_interval,
                 status_interval=args.status_interval,
+                btc_stream=args.btc_stream,
+                market_stream=args.market_stream,
             )
         if args.simulate_paired:
             config = _load_policy_config(args.policy_config)
@@ -1123,6 +1523,9 @@ def main() -> int:
         if args.analyze_early_btc:
             config = _load_policy_config(args.policy_config)
             analyze_early_btc_signal(db, config)
+        if args.analyze_btc_lag:
+            config = _load_policy_config(args.policy_config)
+            analyze_btc_market_lag(db, config)
     finally:
         db.close()
     return 0
