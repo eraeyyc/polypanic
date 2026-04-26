@@ -747,7 +747,7 @@ class ResearchCollector:
                         last_tick = tick
                         if paper:
                             paper.on_tick(tick)
-                        if status_interval > 0 and (now - last_status_at) >= status_interval:
+                        if status_interval >= 0 and (status_interval == 0 or (now - last_status_at) >= status_interval):
                             logging.info(
                                 "Collecting %s | ticks=%d market_ticks=%d | %.1fs left | "
                                 "UP %.2f/%.2f DN %.2f/%.2f | BTC $%.2f (%+.2f) | %s",
