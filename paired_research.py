@@ -663,6 +663,23 @@ class ResearchCollector:
                             current_slug,
                             market_tick_count,
                         )
+                    if paper and current_slug:
+                        winner = self._fetch_resolution(current_slug)
+                        if winner:
+                            btc_close = self.btc.get_btc_price()
+                            self.db.upsert_market({
+                                "slug": current_slug,
+                                "window_start_ts": None,
+                                "window_end_ts": None,
+                                "market_id": "", "condition_id": "",
+                                "up_token_id": "", "down_token_id": "",
+                                "btc_open_price": None,
+                                "btc_close_price": btc_close,
+                                "resolution": winner,
+                            })
+                            paper.on_resolution(current_slug, winner)
+                        else:
+                            logging.warning("Paper | %s no resolution yet at rollover — will retry", current_slug)
                     event = self.poly.get_market_by_slug(slug)
                     tokens = self.poly.extract_token_ids(event) if event else None
                     btc_open_snapshot = self.btc_ws.get_price() if btc_stream == "binance_ws" else None
@@ -862,6 +879,12 @@ class PairedPaperSession:
 
     def on_resolution(self, slug: str, winner: str):
         """Call when a market resolves. Closes the paper window and logs P&L."""
+        already = self.db.conn.execute(
+            "SELECT 1 FROM paired_paper_windows WHERE slug=? AND policy=? AND skipped=0",
+            (slug, self.policy_name),
+        ).fetchone()
+        if already:
+            return
         pos = self._pos if slug == self._current_slug else SimPosition()
         combined_spend = pos.combined_spend
         fee_cost = combined_spend * (self.fee_bps / 10000.0)
