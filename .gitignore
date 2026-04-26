@@ -34,3 +34,4 @@ secrets/
 
 # Local repo instructions
 AGENTS.md
+*.csv
