@@ -1086,6 +1086,15 @@ def policy_cost_gated_up_bias_flat_only(pos: SimPosition, tick: ResearchTick, co
     return policy_cost_gated_up_bias(pos, tick, config)
 
 
+def policy_cost_gated_up_bias_time_filtered(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
+    import datetime as _dt
+    skip_hours = set(config.get("skip_hours", [17, 18, 19, 20, 21]))
+    local_hour = _dt.datetime.fromtimestamp(tick.timestamp).hour
+    if local_hour in skip_hours:
+        return {"up": 0.0, "down": 0.0}
+    return policy_cost_gated_up_bias_flat_only(pos, tick, config)
+
+
 def policy_cost_gated_up_bias_momentum(pos: SimPosition, tick: ResearchTick, config: dict) -> dict[str, float]:
     min_ratio = float(config.get("min_cost_ratio", 0.70))
     max_ratio = float(config.get("max_cost_ratio", 0.89))
@@ -1319,6 +1328,7 @@ POLICIES: dict[str, Callable[[SimPosition, ResearchTick, dict], dict[str, float]
     "cost_gated_up_bias": policy_cost_gated_up_bias,
     "cost_gated_up_bias_late_guard": policy_cost_gated_up_bias_late_guard,
     "cost_gated_up_bias_flat_only": policy_cost_gated_up_bias_flat_only,
+    "cost_gated_up_bias_time_filtered": policy_cost_gated_up_bias_time_filtered,
     "cost_gated_up_bias_momentum": policy_cost_gated_up_bias_momentum,
     "favorite_cost_capped_share_clips": policy_favorite_cost_capped_share_clips,
     "market_favorite_share_clips": policy_market_favorite_share_clips,

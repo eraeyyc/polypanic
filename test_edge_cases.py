@@ -17,6 +17,7 @@ from hypothesis import strategies as st
 from paired_research import (
     POLICIES,
     MarketContext,
+    policy_cost_gated_up_bias_time_filtered,
     MarketQualityCheck,
     ResearchDatabase,
     ResearchTick,
@@ -875,6 +876,86 @@ class HypothesisPropertyTests(unittest.TestCase):
             self.assertGreater(ratio, 0.0)
             self.assertGreaterEqual(ratio, lo)
             self.assertLessEqual(ratio, hi)
+
+
+# ---------------------------------------------------------------------------
+# Policy: cost_gated_up_bias_time_filtered
+# ---------------------------------------------------------------------------
+
+class PolicyTimeFilteredTests(unittest.TestCase):
+    def _tick_at_hour(self, hour: int) -> ResearchTick:
+        import datetime
+        # Build a timestamp whose local hour matches the requested hour.
+        # Use a fixed date (2026-04-20 00:00 local) and add the hour offset.
+        base = datetime.datetime(2026, 4, 20, 0, 0, 0)
+        ts = (base + datetime.timedelta(hours=hour)).timestamp()
+        return _tick(timestamp=ts, up_ask=0.40, down_ask=0.60, btc_delta=0.0)
+
+    def test_skips_entry_in_blocked_hours(self):
+        pos = _empty_pos()
+        for h in [17, 18, 19, 20, 21]:
+            with self.subTest(hour=h):
+                t = self._tick_at_hour(h)
+                spends = policy_cost_gated_up_bias_time_filtered(
+                    pos, t,
+                    {
+                        "skip_hours": [17, 18, 19, 20, 21],
+                        "min_cost_ratio": 0.70, "max_cost_ratio": 0.89,
+                        "target_cost_ratio": 0.80, "flat_btc_abs": 15.0,
+                    },
+                )
+                self.assertEqual(spends, {"up": 0.0, "down": 0.0}, f"hour {h} should be blocked")
+
+    def test_allows_entry_outside_blocked_hours(self):
+        pos = _empty_pos()
+        for h in [0, 2, 11, 14]:
+            with self.subTest(hour=h):
+                t = self._tick_at_hour(h)
+                spends = policy_cost_gated_up_bias_time_filtered(
+                    pos, t,
+                    {
+                        "skip_hours": [17, 18, 19, 20, 21],
+                        "min_cost_ratio": 0.70, "max_cost_ratio": 0.89,
+                        "target_cost_ratio": 0.80, "flat_btc_abs": 15.0,
+                    },
+                )
+                self.assertGreater(spends["up"] + spends["down"], 0.0, f"hour {h} should be allowed")
+
+    def test_empty_skip_hours_falls_through_to_flat_only(self):
+        pos = _empty_pos()
+        t = self._tick_at_hour(19)
+        spends = policy_cost_gated_up_bias_time_filtered(
+            pos, t,
+            {
+                "skip_hours": [],
+                "min_cost_ratio": 0.70, "max_cost_ratio": 0.89,
+                "target_cost_ratio": 0.80, "flat_btc_abs": 15.0,
+            },
+        )
+        self.assertGreater(spends["up"] + spends["down"], 0.0)
+
+    def test_respects_flat_btc_filter_within_allowed_hours(self):
+        pos = _empty_pos()
+        t = self._tick_at_hour(14)
+        t_moving = ResearchTick(
+            timestamp=t.timestamp, seconds_remaining=t.seconds_remaining,
+            up_bid=t.up_bid, up_ask=t.up_ask,
+            down_bid=t.down_bid, down_ask=t.down_ask,
+            btc_spot=t.btc_spot, btc_delta=20.0,  # outside flat band
+        )
+        spends = policy_cost_gated_up_bias_time_filtered(
+            pos, t_moving,
+            {"skip_hours": [17, 18, 19, 20, 21], "flat_btc_abs": 5.0},
+        )
+        self.assertEqual(spends, {"up": 0.0, "down": 0.0})
+
+    def test_default_skip_hours_blocks_17_to_21(self):
+        pos = _empty_pos()
+        for h in [17, 18, 19, 20, 21]:
+            with self.subTest(hour=h):
+                t = self._tick_at_hour(h)
+                spends = policy_cost_gated_up_bias_time_filtered(pos, t, {})
+                self.assertEqual(spends, {"up": 0.0, "down": 0.0})
 
 
 if __name__ == "__main__":
