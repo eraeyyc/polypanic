@@ -885,7 +885,19 @@ class PairedPaperSession:
         ).fetchone()
         if already:
             return
-        pos = self._pos if slug == self._current_slug else SimPosition()
+        # Reconstruct position from DB trades — immune to timing/reset races
+        rows = self.db.conn.execute(
+            "SELECT side, spend, shares FROM paired_paper_trades WHERE slug=? AND policy=?",
+            (slug, self.policy_name),
+        ).fetchall()
+        pos = SimPosition()
+        for r in rows:
+            if r[0] == "up":
+                pos.up_spend += r[1]
+                pos.up_shares += r[2]
+            else:
+                pos.down_spend += r[1]
+                pos.down_shares += r[2]
         combined_spend = pos.combined_spend
         fee_cost = combined_spend * (self.fee_bps / 10000.0)
         gross_pnl = (pos.up_shares if winner == "Up" else pos.down_shares) - combined_spend
