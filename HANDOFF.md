@@ -1,4 +1,4 @@
-# HANDOFF.md — Polymarket BTC 5-Min Research Pivot
+# HANDOFF.md
 
 Context for the next session.
 
@@ -6,134 +6,206 @@ Context for the next session.
 
 `/Users/MAC/projects/polypanic`
 
-## Current state
+## Big picture
 
-This repo has pivoted away from the original one-sided exit-target strategy.
+This repo started as a Polymarket BTC 5-minute one-sided observer/live-trader project.
 
-What is currently true:
-- `observer.py` / `trader.py` remain runnable as legacy/reference infrastructure
-- the live execution/accounting stack is much more robust than it was initially
-- a public-wallet analysis strongly suggests the real opportunity may be a paired hold-to-resolution strategy
-- the main path is now research-first, not more live tuning of the old strategy
+The work then split into two tracks:
 
-Do not treat older live or paper DBs as clean strategy evidence. Many were contaminated by state bugs and by multiple strategy revisions.
+1. **Research track**
+   - reverse-engineer a successful public wallet
+   - collect a dedicated paired-market dataset
+   - simulate paired hold-to-resolution policies
 
-## Current recommended workflow
+2. **Infrastructure track**
+   - keep the legacy live execution stack operational and trustworthy enough to reuse
+   - harden reconciliation, accounting, and state recovery
+   - most recently, migrate the live path from CLOB V1 to **CLOB V2**
 
-### 1. Reconstruct the benchmark wallet
+The research track is the current main strategy direction.
+The live track is still important because it is the exchange/accounting infrastructure the repo may reuse later.
 
-```bash
-python3 wallet_analyzer.py 0xe0229e10a858860218b6132f4234602c47bd6603 --reconstruct 50 --summary-by winner
-```
+## Why the strategy focus changed
 
-### 2. Collect a fresh paired research dataset
+The original one-sided entry/exit strategy never fully inspired confidence. Over time, several things became clear:
 
-```bash
-./run.sh paired_research.py --collect --db paired_research.db --duration-hours 24 --poll-interval 3
-```
+- paper/live results were sensitive to bugs, state drift, and strategy revisions
+- many apparent results were contaminated by legacy issues
+- a successful public wallet (`0xe0229e10a858860218b6132f4234602c47bd6603`) did **not** look like a simple one-sided trader
 
-### 3. Simulate paired policies
+Public wallet reconstruction suggested a very different shape:
 
-```bash
-./run.sh paired_research.py \
-  --simulate-paired \
-  --db paired_research.db \
-  --policy all \
-  --policy-config '{"fee_bps":7.2,"slippage_bps":10}'
-```
+- buys both `Up` and `Down` in most BTC 5-minute windows
+- often scales in multiple times per window
+- appears to hold through resolution and realize via redemption rather than visible sells
+- seems to derive edge from a paired structure plus uneven side weighting, not from the old exit-target logic
 
-Notes:
-- Use separate research DBs from the legacy observer/live DBs.
-- Keep collector settings stable for the full run.
-- No new live trading should start until the paired-policy path shows durable net-positive results after costs.
-
-## Current strategy picture
-
-The old one-sided strategy still appears to have some paper edge in narrow slices, but it is no longer the main hypothesis.
-
-The stronger current lead is:
-- buy both sides in BTC 5-minute markets
-- weight them unevenly
-- hold to resolution
-- redeem winners rather than relying on live exits
-
-This came from reconstructing a successful public wallet and cross-checking API data with OCR’d activity/closed-position PDFs.
-
-## Major fixes already shipped
-
-### Live-state / execution fixes
-
-1. Terminal order handling now treats `closed` as terminal, so disappeared FAK orders no longer block new entries.
-2. Transient market-data failures no longer permanently trip the live kill switch.
-3. Failed submissions are marked `failed` instead of persisting forever as `pending_submit`.
-4. Manual/external sells no longer leave permanent ghost inventory.
-5. Active-window positions are no longer cleared just because the Data API temporarily misses them.
-6. Entry rejection reasons are now logged, which makes “why didn’t it buy?” diagnosable.
-7. Near-close neutral BTC behavior was changed so the bot can hold through resolution when BTC is still within a small neutral range instead of forcing out at a terrible last-second price.
-8. Successful sell fills that leave only sub-minimum dust are now treated as flat positions, and the corresponding orders are marked effectively filled.
-9. Data API position sync no longer resurrects stale position size during an active window after a real sell.
-10. Sell-side ghost-fill hardening is now in place: sell fills are tentative until confirmed by on-chain ERC1155 balance decrease.
-11. Buy-side accounting is still phase-2 work; buys remain off-chain-accounted for now, but divergence checks now compare local/Data API/on-chain balances.
-
-These fixes still matter because they preserved the exchange/accounting infrastructure that the repo may reuse later, even though the core strategy direction changed.
-
-### Paper/live strategy alignment fixes
-
-1. ROI display is now mark-to-market in `observer.py`, so both paper and live show unrealized P&L correctly instead of looking artificially flat after entry.
-2. Paper trader now applies opposite-side post-sell cooldown the same way live trader does.
-3. Paper trader now rejects sub-minimum effective trades when `min(max_position_size, bankroll) < min_position_usdc`, matching live behavior.
-
-### Latency / order-path improvement
-
-1. Live allowance/balance preflight now uses a short-lived cache, reducing redundant REST calls during repeated entry/exit attempts.
-
-## New paired research surfaces
+That is why the repo pivoted toward:
 
 - `wallet_analyzer.py`
-  - reconstructs public wallet BTC 5-minute windows
-  - outputs spend, shares, payout profiles, gross P&L, ROI, timing, and skew metrics
-  - supports grouped summaries by skew, timing, combined cost, and winner overweight
 - `paired_research.py`
-  - collects a dedicated research DB with tick-level paired-market inputs
-  - simulates built-in paired policy families
-  - supports fee/slippage assumptions
-  - can rank policies when run with `--policy all`
 
-## What still needs watching
+rather than more tuning of the original one-sided strategy.
 
-### Research quality
+## What has been done so far
 
-- Need at least one uninterrupted 24–48h research dataset before taking simulator results too seriously.
-- Need to determine whether the benchmark wallet’s edge comes mostly from:
-  - combined cost,
-  - correct directional overweighting,
-  - or both.
-- Need to confirm that any simulated edge survives realistic fee/slippage assumptions and is not driven by a few outlier windows.
+### 1. Legacy live stack hardening
 
-### Legacy live execution / infra
+Before the V2 migration, the legacy live stack was substantially cleaned up. Important shipped fixes included:
 
-- User WebSocket payload coverage is still limited; reconciliation is the safety net.
-- Partial-fill and unusual order-state paths need more live exposure.
-- Settlement-through-resolution needs more real-world validation.
-- Exchange/API latency still dominates local logic time; if the bot feels slow, look at network-bound preflight and reconciliation work first, not `if` statements.
-- Buy-side ghost-fill hardening is still not implemented; current protection is sell-side confirmation plus divergence logging.
+- `closed` orders are treated as terminal and no longer block entries
+- transient market-data failures no longer permanently trip the live kill switch
+- failed submissions persist as `failed`, not ghost `pending_submit`
+- manual/external sells can be reconciled
+- active-window Data API lag no longer clears real positions
+- active-window Data API lag no longer resurrects already-sold size
+- sell fills that leave only dust now flatten the position
+- entry rejection reasons are logged
+- opposite-side flips are blocked during the configured sell cooldown
+- paper/live alignment was improved for cooldown and minimum effective trade size
+- mark-to-market ROI display was fixed
+
+These changes still matter. Even though the strategy thesis changed, the live execution layer is now much more trustworthy than it was at the start.
+
+### 2. Public wallet reverse engineering
+
+`wallet_analyzer.py` became the main behavioral benchmark tool.
+
+What it now does:
+
+- reconstructs BTC 5-minute public-wallet windows
+- estimates spend, shares, payout geometry, ROI, timing, and skew
+- groups windows by timing / skew / combined cost / winner overweight
+- helps reason about what the benchmark wallet is doing
+
+Research takeaways evolved over time, but the durable result was:
+
+- the benchmark wallet does not look like the original one-sided strategy
+- it looks much closer to a paired hold-to-resolution system
+
+### 3. Paired research framework
+
+`paired_research.py` was added as the dedicated collector/simulator for the new thesis.
+
+What it now does:
+
+- collects a separate paired-market research DB
+- simulates built-in paired policy families
+- supports fee/slippage assumptions
+- supports multiple analysis helpers added during the reverse-engineering work
+
+Important result:
+
+- several simple “compressed” theories about the public wallet were tested and did **not** hold up cleanly in simulation
+- the repo still does **not** have a clearly proven paired policy ready for live deployment
+
+So the research conclusion is:
+
+- the paired hold-to-resolution direction is still the most promising
+- but the exact signal/weighting rule is still unresolved
+
+### 4. CLOB V2 migration
+
+Because Polymarket is migrating to CLOB V2, the legacy live path was updated so it does not remain stuck on dead infrastructure.
+
+What changed:
+
+- dependency switched to `py-clob-client-v2`
+- live setup/build paths were migrated to the V2 Python SDK
+- shared read-only host targeting in `observer.py` now supports a custom CLOB host
+- `trader.py` now supports `--clob-host`
+- live market constraints now come from `get_clob_market_info()` / V2 order book data
+- local V1 fee math was removed as authoritative live logic
+- market buys now pass `user_usdc_balance` into the V2 SDK
+- startup now checks for usable **pUSD** collateral
+- startup now neutralizes stale local open-order assumptions if the exchange no longer reports them
+- V2 cancellation/open-order methods were wired into reconciliation
+- tests were updated and passed locally
+
+Important caveat:
+
+- the installed `py-clob-client-v2==1.0.0` package does **not** exactly match the migration docs in every surface area
+- implementation was done against the **actual installed SDK**, not the idealized docs
+
+Also important:
+
+- this migration is **code-complete**, not **runtime-proven**
+- the real V2 smoke test still needs to happen
+
+## Current state
+
+### Main strategy path
+
+Primary focus should still be:
+
+1. reconstruct benchmark wallet behavior
+2. collect clean paired datasets
+3. simulate paired policies
+4. avoid new live deployment until a durable edge survives fees/slippage
+
+### Legacy live path
+
+The live stack is now:
+
+- still legacy relative to the repo’s strategy direction
+- but operationally much more solid than before
+- and now adapted for V2
+
+So if someone needs to continue the live/infrastructure path, they should start from the **V2 code**, not from any old V1 assumption.
+
+## What remains uncertain / unverified
+
+### Research
+
+- the exact paired entry / weighting / continuation rule is still not solved
+- several intuitive theories about the public wallet turned out to be incomplete or wrong
+- there is still no live-ready paired strategy that has clearly cleared the evidence bar
+
+### V2 live runtime
+
+These still need real validation:
+
+- authenticated real-host smoke test was run on 2026-04-27 against `https://clob-v2.polymarket.com` using fee-enabled test market `0xaf5e903876ad42de97e1cf02c2ef8484df69bcfc5541b96a400116557d1e504e`; market info, orderbook, V2 order signing, and live `/order` posting all worked
+- that same smoke test could not complete a fill because the tested wallet had `0` pUSD and `0` exchange allowance
+- exact pUSD readiness / allowance behavior on a funded wallet
+- exact user WebSocket fee payload coverage
+- actual post/cancel/fill lifecycle on V2
+- whether heartbeat behavior is unchanged in practice
+
+## Recommended next steps
+
+### If continuing the research path
+
+1. collect at least one clean uninterrupted 24–48h paired research dataset
+2. keep collector settings stable during the whole run
+3. use `wallet_analyzer.py` and `paired_research.py` as the main surfaces
+4. treat the legacy observer/live DBs as contaminated historical evidence unless there is a specific reason to inspect them
+
+### If continuing the live/V2 path
+
+1. fund the actual wallet with pUSD and approve the exchange / CTF path
+2. rerun a tiny fee-enabled V2 test order on `https://clob-v2.polymarket.com`
+3. verify user WebSocket event fields for fees and fills
+4. verify startup stale-order cleanup against real exchange state
+5. only after that, consider adding richer Safe / approval helpers
 
 ## Things not to regress
 
-- Do not revert the dust-fill handling. It prevents fake residual positions from blocking future trades.
-- Do not revert active-window protection in Data API position sync. It prevents stale API snapshots from resurrecting sold positions.
-- Do not revert failed-order persistence to `failed`.
-- Do not remove entry-rejection logging; it is now the fastest way to debug non-entries.
-- Do not revert the mark-to-market ROI display.
-- Do not revert paper/live alignment on cooldown and min-position behavior.
-- Do not let the new paired-research tools drift into the legacy one-sided strategy path; keep the split explicit.
+- do not revert dust-fill handling
+- do not revert active-window Data API protections
+- do not revert failed-order persistence to `failed`
+- do not revert mark-to-market ROI display
+- do not remove entry-rejection logging
+- do not let paper/live strategy logic drift again
+- do not reintroduce V1 fee assumptions into the live path
+- do not blur the distinction between the paired research path and the legacy live path
 
-## Useful files
+## Files worth reading first
 
-- `observer.py` — base observer, paper trader, analysis path, shared strategy logic
-- `trader.py` — live trader, exchange integration, reconciliation, heartbeats
-- `wallet_analyzer.py` — public wallet reconstruction and behavioral benchmark analysis
-- `paired_research.py` — fresh paired dataset collector and simulator
-- `test_live_trader.py` — regression tests for live-state and shared strategy logic
-- `test_research.py` — regression tests for wallet reconstruction and paired simulation
-- `STATUS.md` — current operational summary
+- `CLAUDE.md` — Claude-specific working guidance
+- `AGENTS.md` — Codex-specific working guidance
+- `wallet_analyzer.py` — public wallet reconstruction
+- `paired_research.py` — paired collector + simulator
+- `trader.py` — V2-migrated legacy live stack
+- `test_live_trader.py` — regression coverage for live logic
+- `STATUS.md` — shorter operational summary

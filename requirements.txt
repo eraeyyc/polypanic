@@ -1,4 +1,4 @@
 requests
-py-clob-client-v2
+py-clob-client-v2==1.0.0
 websockets
 flask

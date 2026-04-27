@@ -2,8 +2,8 @@
 
 This repo now has two distinct paths:
 
-- `observer.py` / `trader.py`: the legacy one-sided strategy and live execution stack
-- `wallet_analyzer.py` / `paired_research.py`: the current paired hold-to-resolution research path
+- `wallet_analyzer.py` / `paired_research.py`: the current main research path
+- `observer.py` / `trader.py`: the legacy paper/live execution stack, now maintained as reference infrastructure and a V2-capable live path
 
 The main direction is no longer tuning the old one-sided exit-target strategy. The repo is now oriented around:
 
@@ -77,9 +77,13 @@ Legacy paper trading and market data collection.
 - paper execution
 - post-hoc analysis
 
+`observer.py` was also updated so the shared read-only market client can target a custom CLOB host, which the live V2 path uses for explicit pre-cutover testing.
+
 ### `trader.py`
 
 Legacy live trading layer built on top of the observer foundation.
+
+It has now been migrated to **Polymarket CLOB V2**.
 
 Current live implementation includes:
 
@@ -88,18 +92,18 @@ Current live implementation includes:
 - live order reconciliation
 - live fill persistence
 - live position tracking
-- fee-aware accounting
-- market-constraint checks
+- V2 market-constraint loading via `get_clob_market_info()`
+- startup pUSD readiness checks
 - settlement P&L at $1/$0 per share on market resolution
-- restart state recovery (mid-window and cross-boundary)
+- restart state recovery and stale-order cleanup
 - live safety gates
 - historical token price backfill
 
-Notes:
+Important live notes:
 
-- live trading is not based on optimistic paper fills
-- settlement uses the actual `winning_asset_id` from the WebSocket, not the paper BTC proxy logic
-- smoke test confirmed: fills, fee tracking, and realized P&L working correctly
+- the live stack is still considered legacy relative to the repo’s main research direction
+- V2 migration is code-complete, but still needs real-host smoke testing and wallet validation
+- local V1-style manual fee math is no longer the source of truth; the SDK and exchange payloads now own that path
 
 ### `wallet_analyzer.py`
 
@@ -115,7 +119,7 @@ This is the new main path for strategy work.
 
 ### `test_live_trader.py` / `test_research.py`
 
-Local regression tests for legacy live-trader logic and the new research pipeline.
+Local regression tests for legacy live-trader logic and the research pipeline.
 
 ## Database
 
@@ -129,7 +133,7 @@ Core tables:
 - `live_trades`
 - `strategy_config`
 
-New live-trader tables:
+Additional live-trader tables:
 
 - `live_orders`
 - `live_fills`
@@ -142,7 +146,7 @@ For live accounting, treat `live_orders`, `live_fills`, and `live_positions` as 
 ## Installation
 
 ```bash
-pip install requests py-clob-client websockets flask
+pip install requests py-clob-client-v2==1.0.0 websockets flask
 ```
 
 If you use `./run.sh`, it will activate the repo `.venv` automatically.
@@ -175,7 +179,7 @@ One-time credential setup:
 export POLYMARKET_PRIVATE_KEY=0x...
 export POLYMARKET_SIGNATURE_TYPE=1
 export POLYMARKET_FUNDER=0x...
-./run.sh trader.py --setup-keys
+python trader.py --setup-keys --clob-host https://clob-v2.polymarket.com
 ```
 
 That derives and stores Polymarket API credentials in `~/.polypanic/keys.json`.
@@ -194,26 +198,32 @@ If your Polymarket account came from Magic Link and you exported the key, the ex
 - `POLYMARKET_SIGNATURE_TYPE=1`
 - `POLYMARKET_FUNDER=<your Polymarket wallet address shown on the site>`
 
-You also need approval on Polygon:
+### V2 collateral notes
 
-```python
-from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+For API-only trading on V2:
 
-client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id="..."))
-```
+- collateral is `pUSD`
+- API traders must wrap `USDC.e -> pUSD` via the Collateral Onramp before trading
+- the live startup path now checks for usable collateral and fails fast if it is missing
+
+Useful docs:
+
+- V2 migration: [docs.polymarket.com/v2-migration](https://docs.polymarket.com/v2-migration)
+- pUSD: [docs.polymarket.com/concepts/pusd](https://docs.polymarket.com/concepts/pusd)
+- market makers getting started: [docs.polymarket.com/market-makers/getting-started](https://docs.polymarket.com/market-makers/getting-started)
 
 ## Legacy live test commands
 
 These remain available for reference and infrastructure validation only.
 
-Example tiny smoke test:
+Example tiny V2 smoke-style run:
 
 ```bash
 export POLYMARKET_PRIVATE_KEY=0x...
 export POLYMARKET_SIGNATURE_TYPE=1
 export POLYMARKET_FUNDER=0x...
 ./run.sh trader.py \
+  --clob-host https://clob-v2.polymarket.com \
   --max-position 1 \
   --min-position 1 \
   --max-total-exposure 2 \
@@ -223,6 +233,7 @@ export POLYMARKET_FUNDER=0x...
 
 Useful live options:
 
+- `--clob-host`
 - `--entry`
 - `--exit`
 - `--entry-delay`
@@ -238,33 +249,22 @@ Useful live options:
 - `--positions-poll-interval`
 - `--max-entry-slippage`
 - `--max-exit-slippage`
-- `--db`
 
-## Historical backfill
+## What is still unverified
 
-You can fetch token price history directly:
+The V2 migration is implemented, and an authenticated smoke test was run against
+`https://clob-v2.polymarket.com` on a fee-enabled test market
+(`0xaf5e903876ad42de97e1cf02c2ef8484df69bcfc5541b96a400116557d1e504e`).
+That confirmed:
 
-```bash
-./run.sh trader.py --backfill-history TOKEN_ID --history-interval 1d --history-fidelity 60
-```
+- V2 market-info fetches work
+- V2 orderbook fetches work
+- V2 market-order signing works with the expected `timestamp` / `metadata` / `builder` fields
+- posting to the live V2 `/order` endpoint works
 
-Or with absolute timestamps:
+What is still blocked / unverified:
 
-```bash
-./run.sh trader.py --backfill-history TOKEN_ID --history-start-ts 1775800000 --history-end-ts 1775880000
-```
-
-## What still needs runtime validation
-
-The code is structurally complete. These pieces need real-exchange confirmation:
-
-- **User WebSocket payloads at higher fill volume** — basic trade/fill events confirmed in smoke test. Partial fills, maker events, unusual order states not yet seen live. Run with `--log-level DEBUG` and watch for `Unknown user event type=` log lines.
-- **Settlement P&L path** — `_settle_market()` is implemented but has never fired on a real resolved position. The first time a position holds to window close, verify `live_positions` is empty afterward and `realized_pnl` is correct.
-- **Fee model accuracy** — compare `live_fills.fee_amount` against actual exchange-reported fees at meaningful notional.
-
-Items from the previous list that are now resolved:
-
-- ~~settlement/redeem reconciliation after resolution~~ — implemented in `_settle_market()`
-- ~~`cancel_market_orders()` behavior~~ — guarded against empty-cancel errors and kill-switch bleed
-- ~~state reload on restart~~ — mid-window and cross-boundary cases both handled
-- ~~market WebSocket payload shape~~ — unknown event types logged at DEBUG
+- actual filled-order lifecycle on V2, because the tested wallet currently has `0` pUSD and `0` exchange allowance
+- exact user WebSocket fee payload coverage on real fills
+- real wallet pUSD readiness / allowance behavior after funding and approval
+- heartbeat behavior on the V2 host

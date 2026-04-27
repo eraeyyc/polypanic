@@ -62,6 +62,7 @@ try:
         ApiCreds,
         BalanceAllowanceParams,
         AssetType,
+        BuilderConfig,
         MarketOrderArgs,
         OpenOrderParams,
         OrderMarketCancelParams,
@@ -85,10 +86,11 @@ except ImportError:
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 WS_USER_URL   = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 DATA_API      = "https://data-api.polymarket.com"
-DEFAULT_LIVE_CLOB_HOST = os.environ.get("POLYMARKET_CLOB_HOST", "https://clob-v2.polymarket.com")
+DEFAULT_LIVE_CLOB_HOST = os.environ.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")
 PUSD_DOCS_URL = "https://docs.polymarket.com/concepts/pusd"
-COLLATERAL_ONRAMP_ADDRESS = "0x39AA0C021dfbaE8faC545936693aC917d5E7563"
-PUSD_TOKEN_ADDRESS = "0x4C221Fa6ad61eF08A43c40F0EA4C9D9b2482Db17"
+COLLATERAL_ONRAMP_ADDRESS = "0x93070a847efEf7F70739046A929D47a521F5B8ee"
+PUSD_TOKEN_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+CTF_EXCHANGE_ADDRESS = "0xE111180000d2663C0091e4f400237545B87B996B"
 POLYGON_RPC_URL = os.environ.get("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 ERC1155_BALANCE_OF_SELECTOR = "0x00fdd58e"
@@ -132,6 +134,13 @@ def _best_effort_create_or_derive_api_creds(client: "ClobClient") -> ApiCreds:
         return client.derive_api_key()
     except Exception:
         return client.create_api_key()
+
+
+def _builder_config_from_env() -> Optional["BuilderConfig"]:
+    builder_code = (os.environ.get("POLY_BUILDER_CODE") or "").strip()
+    if not builder_code:
+        return None
+    return BuilderConfig(builder_code=builder_code)
 
 
 def _extract_order_id(payload: dict) -> str:
@@ -1157,7 +1166,8 @@ class LiveTrader:
             raise RuntimeError(
                 "Collateral allowance is too low for the configured live size. "
                 f"Allowance={allowance:.4f}, required>={min_required:.4f}. "
-                f"Approve pUSD to the Collateral Onramp ({COLLATERAL_ONRAMP_ADDRESS}) "
+                f"Approve the trading contracts to spend your tokens "
+                f"(Exchange {CTF_EXCHANGE_ADDRESS}; sells may also require CTF setApprovalForAll on {CTF_ADDRESS}) "
                 f"and verify the pUSD token ({PUSD_TOKEN_ADDRESS}) is funded. Docs: {PUSD_DOCS_URL}"
             )
 
@@ -2232,6 +2242,7 @@ def setup_keys(
         chain_id=chain_id,
         signature_type=signature_type,
         funder=funder,
+        builder_config=_builder_config_from_env(),
     )
     creds = _best_effort_create_or_derive_api_creds(client)
 
@@ -2311,6 +2322,7 @@ def build_client(
         creds          = creds,
         signature_type = resolved_signature_type,
         funder         = resolved_funder,
+        builder_config = _builder_config_from_env(),
     )
 
 
@@ -2346,8 +2358,8 @@ Examples:
   # One-time key setup
   python trader.py --setup-keys --private-key 0x...
 
-  # Pre-cutover V2 host test
-  python trader.py --private-key 0x... --clob-host https://clob-v2.polymarket.com
+  # Explicit host override (post-migration default is clob.polymarket.com)
+  python trader.py --private-key 0x... --clob-host https://clob.polymarket.com
 
   # Start live trading with default thresholds
   python trader.py --private-key 0x...
