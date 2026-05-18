@@ -1,10 +1,10 @@
 # Status
 
-**Last updated:** 2026-04-16
+**Last updated:** 2026-05-17
 
 ## Primary strategy status
 
-The old one-sided entry/exit strategy is now legacy. The repo’s main path is:
+The old one-sided entry/exit strategy is now legacy. The repo's main path is:
 
 1. public wallet reconstruction via `wallet_analyzer.py`
 2. fresh paired BTC 5-minute dataset collection via `paired_research.py`
@@ -21,13 +21,13 @@ python3 wallet_analyzer.py 0xe0229e10a858860218b6132f4234602c47bd6603 --reconstr
 Collect a fresh research dataset:
 
 ```bash
-./run.sh paired_research.py --collect --db paired_research.db --duration-hours 24 --poll-interval 3
+.venv/Scripts/python paired_research.py --collect --db paired_research.db --duration-hours 24 --poll-interval 3
 ```
 
 Simulate one paired policy:
 
 ```bash
-./run.sh paired_research.py \
+.venv/Scripts/python paired_research.py \
   --simulate-paired \
   --db paired_research.db \
   --policy payout_balanced \
@@ -37,14 +37,30 @@ Simulate one paired policy:
 Rank all built-in paired policies:
 
 ```bash
-./run.sh paired_research.py \
+.venv/Scripts/python paired_research.py \
   --simulate-paired \
   --db paired_research.db \
   --policy all \
   --policy-config '{"fee_bps":7.2,"slippage_bps":10}'
 ```
 
+Note: `run.sh` assumes a Unix `.venv/bin/activate` path and does not work on Windows. Use `.venv/Scripts/python` directly.
+
 ## What is currently fixed
+
+### CLOB V2 migration (merged 2026-05-17)
+
+- dependency is now `py-clob-client-v2==1.0.0` (pinned)
+- default CLOB host is `https://clob.polymarket.com` (post-cutover production)
+- contract addresses updated: COLLATERAL_ONRAMP, PUSD_TOKEN, CTF_EXCHANGE
+- `BuilderConfig` support via `POLY_BUILDER_CODE` env var
+- market constraints come from `get_clob_market_info()` / V2 book data
+- market buys pass `user_usdc_balance` into the SDK for fee-adjusted sizing
+- local V1-style fee math removed as authoritative logic
+- startup checks for usable pUSD collateral
+- startup neutralizes stale local open-order assumptions on exchange mismatch
+- V2 cancel/open-order methods wired into reconciliation
+- `trader.py` supports `--clob-host` for explicit host override
 
 ### Live trading / reconciliation
 
@@ -67,12 +83,12 @@ Rank all built-in paired policies:
 - paper trader now mirrors live minimum effective trade-size behavior
 - `observer.py --analyze` now prints local-time session and hour-of-day trade timing summaries
 
-### New paired research path
+### Paired research path
 
-- `wallet_analyzer.py` now reconstructs per-window BTC 5-minute public wallet behavior
+- `wallet_analyzer.py` reconstructs per-window BTC 5-minute public wallet behavior
 - reconstruction output includes spend, shares, payout profile, gross P&L, ROI, timing, and skew metrics
 - grouped summaries can bucket windows by skew, timing, combined cost, and winner overweight
-- `paired_research.py` now collects a dedicated BTC 5-minute research DB separate from legacy paper DBs
+- `paired_research.py` collects a dedicated BTC 5-minute research DB separate from legacy paper DBs
 - paired-policy simulation supports fee and slippage assumptions and can rank built-in policy families
 
 ### Order-path latency
@@ -81,6 +97,11 @@ Rank all built-in paired policies:
 - direct Polygon `eth_call` balance reads are now used for sell confirmation and divergence checks
 
 ## Current evidence
+
+### Dataset collection
+
+A fresh 24-hour paired research dataset collection was started 2026-05-17. Output: `paired_research.db`.
+Do not simulate against this DB until the collection completes.
 
 ### Legacy paper trading
 
@@ -99,14 +120,24 @@ The public benchmark wallet strongly suggests a different strategy shape:
 
 ### Legacy live trading
 
-Live trading works at the infrastructure layer, but the old strategy is no longer the main direction. Do not start new live tests until the paired research path clears its evidence bar.
+Live trading works at the infrastructure layer and is now V2-migrated, but the old one-sided strategy is no longer the main direction. Do not start new live tests until the paired research path clears its evidence bar.
 
 ## What still needs validation
 
-- at least one clean 24–48h paired research dataset
+### Research (blocking for live deployment)
+
+- simulation results from the 2026-05-17 dataset once collection completes
 - simulation results that stay positive after fee/slippage assumptions
 - explainable weighting rules, not just one-off wallet mimicry
 - confirmation that the paired edge is not concentrated in a few outlier windows
+
+### V2 live runtime (pre-live checklist)
+
+- funded-wallet V2 fill test against `https://clob.polymarket.com`; pre-cutover smoke test on `https://clob-v2.polymarket.com` confirmed order signing and `/order` posting work, but could not complete a fill (0 pUSD / 0 allowance on test wallet)
+- pUSD readiness and allowance behavior on a real funded wallet
+- user WebSocket fee payload coverage for V2 fee fields and unusual fills
+- actual post/cancel/fill lifecycle on V2
+- heartbeat behavior on V2
 
 ## Practical guidance
 
@@ -114,3 +145,4 @@ Live trading works at the infrastructure layer, but the old strategy is no longe
 - Use a fresh `paired_research.db` or clearly versioned research DBs.
 - Keep collector settings stable for the full 24–48h dataset.
 - Do not start new live tests until the paired simulation path looks durable after costs.
+- All live-infrastructure work should assume V2, not V1.

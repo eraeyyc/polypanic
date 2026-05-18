@@ -204,6 +204,7 @@ Current main research questions:
 - exact user WebSocket payload coverage for fee fields and unusual fills
 - pUSD readiness behavior against a real funded wallet
 - whether heartbeat behavior is unchanged in practice on V2
+- simulation results from the 24h paired dataset started 2026-05-17 (`paired_research.db`) — run `--simulate-paired --policy all` once collection completes
 - more clean daytime live sessions
 - broader settlement-through-resolution coverage
 

@@ -4,7 +4,7 @@ Context for the next session.
 
 ## Repo / working directory
 
-`/Users/MAC/projects/polypanic`
+`C:\Users\erica\Projects\polypanic`
 
 ## Big picture
 
@@ -176,8 +176,8 @@ These still need real validation:
 
 ### If continuing the research path
 
-1. collect at least one clean uninterrupted 24–48h paired research dataset
-2. keep collector settings stable during the whole run
+1. ~~collect at least one clean uninterrupted 24–48h paired research dataset~~ — **in progress** (started 2026-05-17, output: `paired_research.db`)
+2. once collection completes, run `--simulate-paired --policy all` and check net result after fees/slippage
 3. use `wallet_analyzer.py` and `paired_research.py` as the main surfaces
 4. treat the legacy observer/live DBs as contaminated historical evidence unless there is a specific reason to inspect them
 
